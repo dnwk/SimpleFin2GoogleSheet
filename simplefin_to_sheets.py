@@ -228,6 +228,32 @@ class GoogleSheetsClient:
         """
         self.spreadsheet_id = spreadsheet_id
         self.service = self._authenticate(credentials_file)
+    
+    @staticmethod
+    def sanitize_string(value: str) -> str:
+        """
+        Sanitize string for safe writing to Google Sheets
+        - Prevents formula injection by escaping leading special characters
+        - Removes null bytes and other problematic characters
+        
+        Args:
+            value: String to sanitize
+            
+        Returns:
+            Sanitized string safe for Google Sheets
+        """
+        if not isinstance(value, str):
+            return value
+        
+        # Remove null bytes and other control characters (except newlines/tabs)
+        value = ''.join(char for char in value if char == '\n' or char == '\t' or ord(char) >= 32)
+        
+        # Prevent formula injection - escape leading special characters
+        # Google Sheets formulas start with: = + - @ 
+        if value and value[0] in ('=', '+', '-', '@'):
+            value = "'" + value  # Prefix with single quote to treat as text
+        
+        return value
         
     def _authenticate(self, credentials_file: str):
         """Authenticate with Google Sheets API"""
@@ -1119,13 +1145,14 @@ class SimplefinToSheetsSync:
                 if sheet_name:
                     sheet_gid = self.sheets.get_sheet_gid(sheet_name)
                     if sheet_gid is not None:
-                        # Use actual GID for hyperlink
-                        account_name_formula = f'=HYPERLINK("#gid={sheet_gid}&range=A1", "{account_name}")'
+                        # Use actual GID for hyperlink - sanitize account name for display
+                        sanitized_name = self.sheets.sanitize_string(account_name)
+                        account_name_formula = f'=HYPERLINK("#gid={sheet_gid}&range=A1", "{sanitized_name}")'
                     else:
                         # Sheet doesn't exist yet (initial setup), use plain name
-                        account_name_formula = account_name
+                        account_name_formula = self.sheets.sanitize_string(account_name)
                 else:
-                    account_name_formula = account_name
+                    account_name_formula = self.sheets.sanitize_string(account_name)
                 
                 data.append([
                     account_name_formula,
@@ -1271,13 +1298,13 @@ class SimplefinToSheetsSync:
         
         # Account information section
         data.append(['Account Information'])
-        data.append(['Account ID:', account.get('id', '')])
-        data.append(['Account Name:', account.get('name', '')])
-        data.append(['Currency:', account.get('currency', 'USD')])
+        data.append(['Account ID:', self.sheets.sanitize_string(account.get('id', ''))])
+        data.append(['Account Name:', self.sheets.sanitize_string(account.get('name', ''))])
+        data.append(['Currency:', self.sheets.sanitize_string(account.get('currency', 'USD'))])
         data.append(['Balance:', account.get('balance', '')])
         data.append(['Available Balance:', account.get('available-balance', '')])
         data.append(['Balance Date:', account.get('balance-date', '')])
-        data.append(['Organization:', account.get('org', {}).get('name', '')])
+        data.append(['Organization:', self.sheets.sanitize_string(account.get('org', {}).get('name', ''))])
         data.append([])  # Empty row
         
         # Holdings section (if available)
@@ -1297,15 +1324,15 @@ class SimplefinToSheetsSync:
             
             # Add holdings rows
             for holding in sorted_holdings:
-                symbol = holding.get('symbol', '')
-                description = holding.get('description', '')
+                symbol = self.sheets.sanitize_string(holding.get('symbol', ''))
+                description = self.sheets.sanitize_string(holding.get('description', ''))
                 shares = holding.get('shares', '')
                 purchase_price = holding.get('purchase_price', '')
                 cost_basis = holding.get('cost_basis', '')
                 market_value = holding.get('market_value', '')
                 created = holding.get('created', '')
-                currency = holding.get('currency', 'USD')
-                holding_id = holding.get('id', '')
+                currency = self.sheets.sanitize_string(holding.get('currency', 'USD'))
+                holding_id = self.sheets.sanitize_string(holding.get('id', ''))
                 
                 # Convert Unix timestamp to Google Sheets date formula
                 if created:
@@ -1334,9 +1361,9 @@ class SimplefinToSheetsSync:
         # Add transaction rows
         for txn in sorted_transactions:
             posted_date = txn.get('posted', '')
-            description = txn.get('description', '')
+            description = self.sheets.sanitize_string(txn.get('description', ''))
             amount = txn.get('amount', '')
-            txn_id = txn.get('id', '')
+            txn_id = self.sheets.sanitize_string(txn.get('id', ''))
             pending = 'Yes' if txn.get('pending', False) else 'No'
             
             # Convert Unix timestamp to Google Sheets date formula
