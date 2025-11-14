@@ -19,12 +19,15 @@ from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
+# Get the directory where this script is located
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('simplefin_sync.log', encoding='utf-8'),
+        logging.FileHandler(os.path.join(SCRIPT_DIR, 'simplefin_sync.log'), encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -266,6 +269,10 @@ class GoogleSheetsClient:
     def _authenticate(self, credentials_file: str):
         """Authenticate with Google Sheets API"""
         try:
+            # Convert to absolute path relative to script directory if not absolute
+            if not os.path.isabs(credentials_file):
+                credentials_file = os.path.join(SCRIPT_DIR, credentials_file)
+            
             SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
             creds = Credentials.from_service_account_file(credentials_file, scopes=SCOPES)
             service = build('sheets', 'v4', credentials=creds)
@@ -713,6 +720,10 @@ class SimplefinToSheetsSync:
     def _load_config(self, config_file: str) -> Dict[str, Any]:
         """Load configuration from JSON file"""
         try:
+            # Convert to absolute path relative to script directory
+            if not os.path.isabs(config_file):
+                config_file = os.path.join(SCRIPT_DIR, config_file)
+            
             with open(config_file, 'r') as f:
                 config = json.load(f)
             
@@ -720,6 +731,10 @@ class SimplefinToSheetsSync:
             for key in required_keys:
                 if key not in config:
                     raise ValueError(f"Missing required configuration key: {key}")
+            
+            # Convert google_credentials_file to absolute path relative to script directory
+            if 'google_credentials_file' in config and not os.path.isabs(config['google_credentials_file']):
+                config['google_credentials_file'] = os.path.join(SCRIPT_DIR, config['google_credentials_file'])
             
             # Must have either simplefin_token or simplefin_access_url
             if 'simplefin_token' not in config and 'simplefin_access_url' not in config:
@@ -777,7 +792,12 @@ class SimplefinToSheetsSync:
         try:
             self.config['simplefin_access_url'] = access_url
             
-            with open(self.config_file, 'w') as f:
+            # Convert to absolute path relative to script directory
+            config_file_path = self.config_file
+            if not os.path.isabs(config_file_path):
+                config_file_path = os.path.join(SCRIPT_DIR, config_file_path)
+            
+            with open(config_file_path, 'w') as f:
                 json.dump(self.config, f, indent=2)
             
             logger.info("Saved SimpleFin access URL to configuration file for future use")
