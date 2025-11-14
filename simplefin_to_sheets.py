@@ -1,0 +1,1501 @@
+#!/usr/bin/env python3
+"""
+SimpleFin to Google Sheets Integration
+
+This script fetches account information and transactions from SimpleFin API
+and syncs them to Google Sheets. Each account gets its own sheet with
+account details and last 60 days of transactions.
+"""
+
+import os
+import json
+import logging
+import time
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Any
+import base64
+import requests
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('simplefin_sync.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+def retry_on_rate_limit(max_retries=5, initial_delay=1):
+    """
+    Decorator to retry API calls on rate limit errors with exponential backoff
+    
+    Args:
+        max_retries: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds (will be doubled for each retry)
+    """
+    def decorator(func):
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except HttpError as e:
+                    # Check if it's a rate limit error (429)
+                    if e.resp.status == 429:
+                        if attempt < max_retries - 1:
+                            logger.warning(f"Rate limit hit, retrying in {delay} seconds... (attempt {attempt + 1}/{max_retries})")
+                            time.sleep(delay)
+                            delay *= 2  # Exponential backoff
+                        else:
+                            logger.error(f"Rate limit exceeded after {max_retries} retries")
+                            raise
+                    else:
+                        # Not a rate limit error, raise immediately
+                        raise
+            return None
+        return wrapper
+    return decorator
+
+
+class SimplefinClient:
+    """Client for interacting with SimpleFin API"""
+    
+    def __init__(self, access_url: str):
+        """
+        Initialize SimpleFin client
+        
+        Args:
+            access_url: SimpleFin access URL (contains credentials)
+        """
+        self.access_url = access_url
+        self.base_url = self._parse_base_url(access_url)
+        self.auth_header = self._create_auth_header(access_url)
+    
+    @staticmethod
+    def claim_token(token: str) -> str:
+        """
+        Claim a SimpleFin token to get access URL
+        
+        Process:
+        1. Base64 decode the token to get the claim URL
+        2. POST to the claim URL to get the access URL
+        
+        Args:
+            token: Base64-encoded SimpleFin token
+            
+        Returns:
+            SimpleFin access URL (format: https://user:pass@bridge.simplefin.org/simplefin)
+        """
+        try:
+            # Step 1: Base64 decode the token to get claim URL
+            logger.info("Decoding SimpleFin token to get claim URL")
+            decoded_bytes = base64.b64decode(token)
+            claim_url = decoded_bytes.decode('utf-8')
+            logger.info(f"Claim URL obtained")
+            
+            # Step 2: POST to claim URL to get access URL
+            logger.info("Claiming SimpleFin token (POST to claim URL)")
+            headers = {'Content-Length': '0'}
+            response = requests.post(claim_url, headers=headers, timeout=30)
+            
+            # Handle HTTP 403 - token already claimed or invalid
+            if response.status_code == 403:
+                logger.error("HTTP 403 Forbidden: SimpleFin token has already been claimed or is invalid")
+                raise ValueError(
+                    "SimpleFin token is invalid or already claimed. "
+                    "Each token can only be claimed once. "
+                    "Please create a new token at https://beta-bridge.simplefin.org/my-account/tokens/create"
+                )
+            
+            response.raise_for_status()
+            
+            access_url = response.text.strip()
+            logger.info("Successfully claimed SimpleFin token and obtained access URL")
+            return access_url
+            
+        except base64.binascii.Error as e:
+            logger.error(f"Error decoding SimpleFin token (invalid base64): {e}")
+            raise ValueError(f"Invalid SimpleFin token format - must be valid base64: {e}")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Error claiming SimpleFin token via POST request: {e}")
+            raise ValueError(f"Failed to claim SimpleFin token: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error claiming SimpleFin token: {e}")
+            raise
+        
+    def _parse_base_url(self, access_url: str) -> str:
+        """Extract base URL from access URL"""
+        # Access URL format: https://username:password@bridge.simplefin.org/simplefin
+        if '@' in access_url:
+            protocol, rest = access_url.split('//', 1)
+            if '@' in rest:
+                _, domain_path = rest.split('@', 1)
+                return f"{protocol}//{domain_path}"
+        return access_url
+    
+    def _create_auth_header(self, access_url: str) -> str:
+        """Create Basic Auth header from access URL"""
+        if '@' in access_url:
+            protocol, rest = access_url.split('//', 1)
+            if '@' in rest:
+                credentials, _ = rest.split('@', 1)
+                auth_bytes = credentials.encode('utf-8')
+                auth_b64 = base64.b64encode(auth_bytes).decode('utf-8')
+                return f"Basic {auth_b64}"
+        return ""
+    
+    def get_accounts(self, max_retries: int = 3) -> Dict[str, Any]:
+        """
+        Fetch all accounts from SimpleFin with retry logic
+        
+        Args:
+            max_retries: Maximum number of retry attempts for timeout/connection errors
+            
+        Returns:
+            Dictionary containing accounts and their information
+        """
+        url = f"{self.base_url}/accounts"
+        headers = {'Authorization': self.auth_header} if self.auth_header else {}
+        
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Fetching accounts from SimpleFin API (attempt {attempt + 1}/{max_retries})")
+                response = requests.get(url, headers=headers, timeout=30)
+                
+                # Handle HTTP 403 - access URL is invalid or revoked
+                if response.status_code == 403:
+                    logger.error("HTTP 403 Forbidden: SimpleFin access URL is invalid or has been revoked")
+                    raise ValueError(
+                        "SimpleFin access URL is invalid or has been revoked. "
+                        "Please create a new token at https://beta-bridge.simplefin.org/my-account/tokens/create "
+                        "and update your config.json with the new token. "
+                        "Remove the old 'simplefin_access_url' from config to claim the new token."
+                    )
+                
+                response.raise_for_status()
+                
+                data = response.json()
+                logger.info(f"Successfully fetched {len(data.get('accounts', []))} accounts")
+                return data
+                
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                    logger.warning(f"SimpleFin API timeout/connection error: {e}. Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Error fetching accounts from SimpleFin after {max_retries} attempts: {e}")
+                    raise
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error fetching accounts from SimpleFin: {e}")
+                raise
+    
+    def get_transactions(self, start_date: datetime, end_date: Optional[datetime] = None, max_retries: int = 3) -> Dict[str, Any]:
+        """
+        Fetch transactions within date range with retry logic
+        
+        Args:
+            start_date: Start date for transactions
+            end_date: End date for transactions (defaults to now)
+            max_retries: Maximum number of retry attempts for timeout/connection errors
+            
+        Returns:
+            Dictionary containing accounts with transactions
+        """
+        if end_date is None:
+            end_date = datetime.now()
+        
+        # SimpleFin uses Unix timestamps
+        start_timestamp = int(start_date.timestamp())
+        end_timestamp = int(end_date.timestamp())
+        
+        url = f"{self.base_url}/accounts"
+        params = {
+            'start-date': start_timestamp,
+            'end-date': end_timestamp
+        }
+        headers = {'Authorization': self.auth_header} if self.auth_header else {}
+        
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Fetching transactions from {start_date.date()} to {end_date.date()} (attempt {attempt + 1}/{max_retries})")
+                response = requests.get(url, headers=headers, params=params, timeout=30)
+                
+                # Handle HTTP 403 - access URL is invalid or revoked
+                if response.status_code == 403:
+                    logger.error("HTTP 403 Forbidden: SimpleFin access URL is invalid or has been revoked")
+                    raise ValueError(
+                        "SimpleFin access URL is invalid or has been revoked. "
+                        "Please create a new token at https://beta-bridge.simplefin.org/my-account/tokens/create "
+                        "and update your config.json with the new token. "
+                        "Remove the old 'simplefin_access_url' from config to claim the new token."
+                    )
+                
+                response.raise_for_status()
+                
+                data = response.json()
+                logger.info(f"Successfully fetched transactions")
+                return data
+                
+            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
+                    logger.warning(f"SimpleFin API timeout/connection error: {e}. Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Error fetching transactions from SimpleFin after {max_retries} attempts: {e}")
+                    raise
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Error fetching transactions from SimpleFin: {e}")
+                raise
+
+
+class GoogleSheetsClient:
+    """Client for interacting with Google Sheets API"""
+    
+    def __init__(self, credentials_file: str, spreadsheet_id: str):
+        """
+        Initialize Google Sheets client
+        
+        Args:
+            credentials_file: Path to Google service account credentials JSON
+            spreadsheet_id: Google Sheets spreadsheet ID
+        """
+        self.spreadsheet_id = spreadsheet_id
+        self.service = self._authenticate(credentials_file)
+        
+    def _authenticate(self, credentials_file: str):
+        """Authenticate with Google Sheets API"""
+        try:
+            SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+            creds = Credentials.from_service_account_file(credentials_file, scopes=SCOPES)
+            service = build('sheets', 'v4', credentials=creds)
+            logger.info("Successfully authenticated with Google Sheets API")
+            return service
+        except Exception as e:
+            logger.error(f"Error authenticating with Google Sheets: {e}")
+            raise
+    
+    @retry_on_rate_limit(max_retries=5, initial_delay=2)
+    def get_all_sheets(self) -> List[Dict[str, Any]]:
+        """Get all sheets in the spreadsheet"""
+        try:
+            time.sleep(0.5)  # Add small delay between requests
+            spreadsheet = self.service.spreadsheets().get(
+                spreadsheetId=self.spreadsheet_id
+            ).execute()
+            return spreadsheet.get('sheets', [])
+        except HttpError as e:
+            logger.error(f"Error getting sheets: {e}")
+            raise
+    
+    @retry_on_rate_limit(max_retries=5, initial_delay=2)
+    def find_sheet_by_account_id(self, account_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Find sheet by account ID stored in the sheet
+        
+        Args:
+            account_id: SimpleFin account ID to search for
+            
+        Returns:
+            Sheet properties if found, None otherwise
+        """
+        try:
+            sheets = self.get_all_sheets()
+            
+            for sheet in sheets:
+                sheet_props = sheet.get('properties', {})
+                sheet_id = sheet_props.get('sheetId')
+                sheet_name = sheet_props.get('title')
+                
+                # Check if sheet is hidden
+                if sheet_props.get('hidden', False):
+                    logger.info(f"Sheet '{sheet_name}' is hidden, skipping")
+                    continue
+                
+                # Read account ID from cell A2
+                try:
+                    time.sleep(0.5)  # Rate limiting between reads
+                    range_name = f"'{sheet_name}'!A2"
+                    result = self.service.spreadsheets().values().get(
+                        spreadsheetId=self.spreadsheet_id,
+                        range=range_name
+                    ).execute()
+                    
+                    values = result.get('values', [])
+                    if values and len(values[0]) > 0:
+                        stored_account_id = values[0][0]
+                        if stored_account_id == account_id:
+                            logger.info(f"Found existing sheet for account {account_id}: {sheet_name}")
+                            return sheet_props
+                except HttpError:
+                    # Sheet might be empty or not readable
+                    continue
+            
+            return None
+            
+        except HttpError as e:
+            logger.error(f"Error searching for sheet: {e}")
+            raise
+    
+    def find_unique_sheet_name(self, base_name: str, account_id: str) -> str:
+        """
+        Find a unique sheet name by checking existing sheets.
+        If base_name exists but has different account ID, append number.
+        
+        Args:
+            base_name: Desired sheet name
+            account_id: Account ID to check for conflicts
+            
+        Returns:
+            Unique sheet name
+        """
+        try:
+            sheets = self.get_all_sheets()
+            existing_names = {}
+            
+            # Build map of sheet names to their account IDs
+            for sheet in sheets:
+                sheet_name = sheet.get('properties', {}).get('title', '')
+                if not sheet_name:
+                    continue
+                    
+                # Try to read account ID from this sheet
+                try:
+                    time.sleep(0.3)  # Rate limiting
+                    range_name = f"'{sheet_name}'!A2"
+                    result = self.service.spreadsheets().values().get(
+                        spreadsheetId=self.spreadsheet_id,
+                        range=range_name
+                    ).execute()
+                    
+                    values = result.get('values', [])
+                    if values and len(values[0]) > 0:
+                        existing_names[sheet_name] = values[0][0]
+                    else:
+                        existing_names[sheet_name] = None
+                except HttpError:
+                    existing_names[sheet_name] = None
+            
+            # If base_name doesn't exist, use it
+            if base_name not in existing_names:
+                return base_name
+            
+            # If base_name exists with same account ID, we'll update it
+            if existing_names[base_name] == account_id:
+                return base_name
+            
+            # base_name exists with different account ID, find unique name
+            counter = 2
+            while True:
+                new_name = f"{base_name} {counter}"
+                if new_name not in existing_names:
+                    logger.info(f"Sheet '{base_name}' exists with different account, using '{new_name}'")
+                    return new_name
+                # If it exists with same account ID, use it
+                if existing_names.get(new_name) == account_id:
+                    return new_name
+                counter += 1
+                
+        except Exception as e:
+            logger.warning(f"Error finding unique sheet name, using base name: {e}")
+            return base_name
+    
+    @retry_on_rate_limit(max_retries=5, initial_delay=2)
+    def create_sheet(self, sheet_name: str) -> int:
+        """
+        Create a new sheet
+        
+        Args:
+            sheet_name: Name for the new sheet
+            
+        Returns:
+            Sheet ID of the created sheet
+        """
+        try:
+            time.sleep(1)  # Rate limiting before write operation
+            request_body = {
+                'requests': [{
+                    'addSheet': {
+                        'properties': {
+                            'title': sheet_name
+                        }
+                    }
+                }]
+            }
+            
+            response = self.service.spreadsheets().batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body=request_body
+            ).execute()
+            
+            sheet_id = response['replies'][0]['addSheet']['properties']['sheetId']
+            logger.info(f"Created new sheet: {sheet_name} (ID: {sheet_id})")
+            return sheet_id
+            
+        except HttpError as e:
+            logger.error(f"Error creating sheet: {e}")
+            raise
+    
+    @retry_on_rate_limit(max_retries=5, initial_delay=2)
+    def update_sheet_data(self, sheet_name: str, data: List[List[Any]]):
+        """
+        Update sheet with data (overwrites existing content)
+        
+        Args:
+            sheet_name: Name of the sheet to update
+            data: 2D list of values to write
+        """
+        try:
+            time.sleep(1)  # Rate limiting before write operation
+            range_name = f"'{sheet_name}'!A1"
+            
+            # Clear existing content first
+            self.service.spreadsheets().values().clear(
+                spreadsheetId=self.spreadsheet_id,
+                range=f"'{sheet_name}'!A:Z"
+            ).execute()
+            
+            time.sleep(0.5)  # Small delay between clear and update
+            
+            # Write new data
+            body = {
+                'values': data
+            }
+            
+            self.service.spreadsheets().values().update(
+                spreadsheetId=self.spreadsheet_id,
+                range=range_name,
+                valueInputOption='USER_ENTERED',  # Allow formulas to be processed
+                body=body
+            ).execute()
+            
+            logger.info(f"Updated sheet '{sheet_name}' with {len(data)} rows")
+            
+        except HttpError as e:
+            logger.error(f"Error updating sheet data: {e}")
+            raise
+    
+    @retry_on_rate_limit(max_retries=5, initial_delay=2)
+    def format_sheet_header(self, sheet_name: str):
+        """Format the header row with bold text and background color"""
+        try:
+            time.sleep(1)  # Rate limiting before format operation
+            sheets = self.get_all_sheets()
+            sheet_id = None
+            
+            for sheet in sheets:
+                if sheet['properties']['title'] == sheet_name:
+                    sheet_id = sheet['properties']['sheetId']
+                    break
+            
+            if sheet_id is None:
+                return
+            
+            requests = [{
+                'repeatCell': {
+                    'range': {
+                        'sheetId': sheet_id,
+                        'startRowIndex': 2,  # Row 3 (0-indexed), where transaction headers are
+                        'endRowIndex': 3,
+                        'startColumnIndex': 0,
+                        'endColumnIndex': 10
+                    },
+                    'cell': {
+                        'userEnteredFormat': {
+                            'backgroundColor': {
+                                'red': 0.9,
+                                'green': 0.9,
+                                'blue': 0.9
+                            },
+                            'textFormat': {
+                                'bold': True
+                            }
+                        }
+                    },
+                    'fields': 'userEnteredFormat(backgroundColor,textFormat)'
+                }
+            }]
+            
+            body = {'requests': requests}
+            self.service.spreadsheets().batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body=body
+            ).execute()
+            
+        except HttpError as e:
+            logger.error(f"Error formatting sheet: {e}")
+    
+    @retry_on_rate_limit(max_retries=5, initial_delay=2)
+    def set_column_width(self, sheet_name: str, column_index: int, width_pixels: int):
+        """Set the width of a specific column"""
+        try:
+            time.sleep(0.5)
+            sheets = self.get_all_sheets()
+            sheet_id = None
+            
+            for sheet in sheets:
+                if sheet['properties']['title'] == sheet_name:
+                    sheet_id = sheet['properties']['sheetId']
+                    break
+            
+            if sheet_id is None:
+                return
+            
+            requests = [{
+                'updateDimensionProperties': {
+                    'range': {
+                        'sheetId': sheet_id,
+                        'dimension': 'COLUMNS',
+                        'startIndex': column_index,
+                        'endIndex': column_index + 1
+                    },
+                    'properties': {
+                        'pixelSize': width_pixels
+                    },
+                    'fields': 'pixelSize'
+                }
+            }]
+            
+            body = {'requests': requests}
+            self.service.spreadsheets().batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body=body
+            ).execute()
+            
+        except HttpError as e:
+            logger.error(f"Error setting column width: {e}")
+    
+    @retry_on_rate_limit(max_retries=5, initial_delay=2)
+    def hide_sheet(self, sheet_name: str):
+        """Hide a sheet"""
+        try:
+            time.sleep(0.5)
+            sheets = self.get_all_sheets()
+            sheet_id = None
+            
+            for sheet in sheets:
+                if sheet['properties']['title'] == sheet_name:
+                    sheet_id = sheet['properties']['sheetId']
+                    break
+            
+            if sheet_id is None:
+                return
+            
+            requests = [{
+                'updateSheetProperties': {
+                    'properties': {
+                        'sheetId': sheet_id,
+                        'hidden': True
+                    },
+                    'fields': 'hidden'
+                }
+            }]
+            
+            body = {'requests': requests}
+            self.service.spreadsheets().batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body=body
+            ).execute()
+            
+        except HttpError as e:
+            logger.error(f"Error hiding sheet: {e}")
+    
+    @retry_on_rate_limit(max_retries=5, initial_delay=2)
+    def unhide_sheet(self, sheet_name: str):
+        """Unhide a sheet"""
+        try:
+            time.sleep(0.5)
+            sheets = self.get_all_sheets()
+            sheet_id = None
+            
+            for sheet in sheets:
+                if sheet['properties']['title'] == sheet_name:
+                    sheet_id = sheet['properties']['sheetId']
+                    break
+            
+            if sheet_id is None:
+                return
+            
+            requests = [{
+                'updateSheetProperties': {
+                    'properties': {
+                        'sheetId': sheet_id,
+                        'hidden': False
+                    },
+                    'fields': 'hidden'
+                }
+            }]
+            
+            body = {'requests': requests}
+            self.service.spreadsheets().batchUpdate(
+                spreadsheetId=self.spreadsheet_id,
+                body=body
+            ).execute()
+            
+        except HttpError as e:
+            logger.error(f"Error unhiding sheet: {e}")
+
+
+class SimplefinToSheetsSync:
+    """Main synchronization class"""
+    
+    def __init__(self, config_file: str):
+        """
+        Initialize sync service
+        
+        Args:
+            config_file: Path to configuration JSON file
+        """
+        self.config = self._load_config(config_file)
+        self.config_file = config_file
+        
+        # Get access URL from token or use cached access URL
+        access_url = self._get_access_url()
+        
+        self.simplefin = SimplefinClient(access_url)
+        self.sheets = GoogleSheetsClient(
+            self.config['google_credentials_file'],
+            self.config['spreadsheet_id']
+        )
+    
+    def _load_config(self, config_file: str) -> Dict[str, Any]:
+        """Load configuration from JSON file"""
+        try:
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+            
+            required_keys = ['google_credentials_file', 'spreadsheet_id']
+            for key in required_keys:
+                if key not in config:
+                    raise ValueError(f"Missing required configuration key: {key}")
+            
+            # Must have either simplefin_token or simplefin_access_url
+            if 'simplefin_token' not in config and 'simplefin_access_url' not in config:
+                raise ValueError("Configuration must contain either 'simplefin_token' or 'simplefin_access_url'")
+            
+            return config
+            
+        except Exception as e:
+            logger.error(f"Error loading configuration: {e}")
+            raise
+    
+    def _get_access_url(self) -> str:
+        """
+        Get SimpleFin access URL - either from cached value or by claiming token
+        
+        Returns:
+            SimpleFin access URL
+        """
+        # If we already have a cached access URL, use it
+        if 'simplefin_access_url' in self.config and self.config['simplefin_access_url']:
+            logger.info("Using cached SimpleFin access URL from configuration")
+            return self.config['simplefin_access_url']
+        
+        # Otherwise, claim the token to get access URL
+        if 'simplefin_token' in self.config and self.config['simplefin_token']:
+            logger.info("Claiming SimpleFin token to obtain access URL")
+            access_url = SimplefinClient.claim_token(self.config['simplefin_token'])
+            
+            # Always save the access URL to config for future use
+            self._save_access_url(access_url)
+            
+            return access_url
+        
+        raise ValueError("No valid SimpleFin token or access URL found in configuration")
+    
+    def _save_access_url(self, access_url: str):
+        """
+        Save claimed access URL to config file for future use
+        This is always done to prevent losing the access URL since tokens can only be claimed once.
+        
+        Args:
+            access_url: SimpleFin access URL to save
+        """
+        try:
+            self.config['simplefin_access_url'] = access_url
+            
+            with open(self.config_file, 'w') as f:
+                json.dump(self.config, f, indent=2)
+            
+            logger.info("Saved SimpleFin access URL to configuration file for future use")
+            logger.info("Tip: You can now remove 'simplefin_token' from config if desired")
+            
+        except Exception as e:
+            logger.warning(f"Could not save access URL to config file: {e}")
+            logger.info("Access URL will need to be claimed again on next run")
+    
+    def _get_index_data(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Read the Index sheet to get existing account mappings and ignore flags
+        
+        Returns:
+            Dictionary mapping account_id to {account_name, sheet_name, balance, ignore, last_updated}
+        """
+        try:
+            index_map = {}
+            
+            # Try to read Index sheet
+            try:
+                time.sleep(0.5)
+                result = self.sheets.service.spreadsheets().values().get(
+                    spreadsheetId=self.sheets.spreadsheet_id,
+                    range="'Index'!A2:F1000"  # Read all data rows
+                ).execute()
+                
+                values = result.get('values', [])
+                for row in values:
+                    if len(row) >= 2:  # At least account name and ID
+                        account_name = row[0]  # Column A
+                        account_id = row[1]    # Column B
+                        balance = row[2] if len(row) > 2 else ''
+                        sheet_name = row[3] if len(row) > 3 else ''
+                        # Default to false if not specified or invalid
+                        ignore_str = row[4].strip().lower() if len(row) > 4 and row[4] else 'false'
+                        ignore = ignore_str == 'true'
+                        last_updated = row[5] if len(row) > 5 else ''
+                        
+                        index_map[account_id] = {
+                            'account_name': account_name,
+                            'sheet_name': sheet_name,
+                            'balance': balance,
+                            'ignore': ignore,
+                            'last_updated': last_updated
+                        }
+                
+                logger.info(f"Loaded {len(index_map)} accounts from Index sheet")
+                
+            except HttpError as e:
+                if e.resp.status == 400:
+                    logger.info("Index sheet does not exist yet")
+                else:
+                    raise
+            
+            return index_map
+            
+        except Exception as e:
+            logger.warning(f"Error reading Index sheet: {e}")
+            return {}
+    
+    def _is_index_empty(self) -> bool:
+        """
+        Check if Index sheet is empty (only has header or no data)
+        
+        Returns:
+            True if Index is empty/new, False if it contains data
+        """
+        try:
+            time.sleep(0.5)
+            result = self.sheets.service.spreadsheets().values().get(
+                spreadsheetId=self.sheets.spreadsheet_id,
+                range="'Index'!A2:B2"  # Check if there's any data in row 2
+            ).execute()
+            
+            values = result.get('values', [])
+            is_empty = len(values) == 0 or len(values[0]) < 2
+            
+            if is_empty:
+                logger.info("Index sheet is empty (new/no data)")
+            else:
+                logger.info("Index sheet contains existing data")
+            
+            return is_empty
+            
+        except HttpError as e:
+            logger.warning(f"Error checking if Index is empty: {e}")
+            return True  # Assume empty if error
+    
+    def _clear_all_sheets_except_index(self):
+        """
+        Delete all sheets except the Index sheet
+        """
+        try:
+            logger.info("Clearing all existing sheets except Index")
+            sheets = self.sheets.get_all_sheets()
+            
+            sheets_to_delete = []
+            for sheet in sheets:
+                sheet_name = sheet.get('properties', {}).get('title', '')
+                sheet_id = sheet.get('properties', {}).get('sheetId')
+                
+                if sheet_name != 'Index' and sheet_id is not None:
+                    sheets_to_delete.append(sheet_id)
+            
+            if sheets_to_delete:
+                logger.info(f"Deleting {len(sheets_to_delete)} existing sheets")
+                
+                # Delete in batches to avoid rate limits
+                for sheet_id in sheets_to_delete:
+                    try:
+                        time.sleep(0.5)  # Rate limiting
+                        requests = [{
+                            'deleteSheet': {
+                                'sheetId': sheet_id
+                            }
+                        }]
+                        
+                        body = {'requests': requests}
+                        self.sheets.service.spreadsheets().batchUpdate(
+                            spreadsheetId=self.sheets.spreadsheet_id,
+                            body=body
+                        ).execute()
+                    except HttpError as e:
+                        logger.warning(f"Could not delete sheet {sheet_id}: {e}")
+                
+                logger.info("Cleared all existing sheets")
+            else:
+                logger.info("No sheets to delete")
+                
+        except Exception as e:
+            logger.error(f"Error clearing sheets: {e}")
+            raise
+    
+    def _initial_setup(self):
+        """
+        Initial setup when Index is empty:
+        1. Clear all sheets except Index
+        2. Fetch all accounts from SimpleFin
+        3. Populate Index with all accounts
+        4. Exit
+        """
+        try:
+            logger.info("=" * 60)
+            logger.info("INITIAL SETUP MODE")
+            logger.info("=" * 60)
+            
+            # Step 1: Clear all existing sheets except Index
+            self._clear_all_sheets_except_index()
+            
+            # Step 2: Fetch all accounts from SimpleFin
+            logger.info("Fetching all accounts from SimpleFin for initial setup")
+            accounts_list = self.simplefin.get_accounts()
+            all_accounts = accounts_list.get('accounts', [])
+            
+            if not all_accounts:
+                logger.warning("No accounts found in SimpleFin")
+                return
+            
+            logger.info(f"Found {len(all_accounts)} accounts in SimpleFin")
+            
+            # Step 3: Populate Index with all accounts
+            accounts_info = []
+            for account in all_accounts:
+                account_id = account.get('id', '')
+                account_name = account.get('name', 'Unknown Account')
+                balance = account.get('balance', '')
+                
+                # Generate sheet name (sanitized account name)
+                base_name = account_name.replace('/', '-').replace('\\', '-')[:100]
+                
+                accounts_info.append({
+                    'account_name': account_name,
+                    'account_id': account_id,
+                    'balance': balance,
+                    'sheet_name': base_name,  # Will be finalized when sheets are created
+                    'ignore': False  # Default to false
+                })
+            
+            # Update Index sheet
+            logger.info("Populating Index sheet with all accounts")
+            self._update_index_sheet(accounts_info, {})
+            
+            logger.info("=" * 60)
+            logger.info("INITIAL SETUP COMPLETE")
+            logger.info("=" * 60)
+            logger.info("Index sheet has been populated with all accounts.")
+            logger.info("Please review the Index sheet and set 'Ignore' to 'true' for accounts you don't want to sync.")
+            logger.info("Run the script again to begin syncing account data.")
+            logger.info("=" * 60)
+            
+        except Exception as e:
+            logger.error(f"Error during initial setup: {e}")
+            raise
+    
+    def _check_and_add_new_accounts(self, existing_index: Dict[str, Dict]) -> bool:
+        """
+        Check SimpleFin for new accounts not in Index and add them.
+        
+        Args:
+            existing_index: Current index data from _get_index_data()
+            
+        Returns:
+            True if new accounts were added (script should exit), False otherwise
+        """
+        try:
+            logger.info("Checking SimpleFin for new accounts...")
+            
+            # Fetch all current accounts from SimpleFin
+            accounts_list = self.simplefin.get_accounts()
+            all_accounts = accounts_list.get('accounts', [])
+            
+            if not all_accounts:
+                logger.warning("No accounts found in SimpleFin")
+                return False
+            
+            # Find accounts not in existing index
+            existing_account_ids = set(existing_index.keys())
+            new_accounts = []
+            
+            for account in all_accounts:
+                account_id = account.get('id', '')
+                if account_id and account_id not in existing_account_ids:
+                    new_accounts.append(account)
+            
+            if not new_accounts:
+                logger.info("No new accounts found")
+                return False
+            
+            logger.info(f"Found {len(new_accounts)} new account(s) in SimpleFin")
+            
+            # Get existing sheet names to avoid duplicates
+            existing_sheets = self.sheets.get_all_sheets()
+            existing_sheet_names = {s.get('properties', {}).get('title', '') for s in existing_sheets}
+            
+            # Prepare new account info
+            new_accounts_info = []
+            for account in new_accounts:
+                account_id = account.get('id', '')
+                account_name = account.get('name', 'Unknown Account')
+                balance = account.get('balance', '')
+                
+                # Generate unique sheet name
+                base_name = account_name.replace('/', '-').replace('\\', '-')[:100]
+                sheet_name = self.sheets.find_unique_sheet_name(base_name, account_id)
+                
+                logger.info(f"  - New account: {account_name} (ID: {account_id}, Sheet: {sheet_name})")
+                
+                new_accounts_info.append({
+                    'account_name': account_name,
+                    'account_id': account_id,
+                    'balance': balance,
+                    'sheet_name': sheet_name,
+                    'ignore': False  # Default to false for new accounts
+                })
+            
+            # Combine existing and new accounts
+            all_accounts_info = []
+            
+            # Add existing accounts first
+            for account_id, info in existing_index.items():
+                all_accounts_info.append({
+                    'account_name': info.get('account_name', ''),
+                    'account_id': account_id,
+                    'balance': info.get('balance', ''),
+                    'sheet_name': info.get('sheet_name', ''),
+                    'ignore': info.get('ignore', False)
+                })
+            
+            # Add new accounts
+            all_accounts_info.extend(new_accounts_info)
+            
+            # Update Index sheet with combined data
+            logger.info("Updating Index sheet with new accounts...")
+            self._update_index_sheet(all_accounts_info, existing_index)
+            
+            logger.info("=" * 60)
+            logger.info("NEW ACCOUNTS ADDED")
+            logger.info("=" * 60)
+            logger.info(f"Added {len(new_accounts)} new account(s) to Index sheet.")
+            logger.info("Please review the Index sheet and set 'Ignore' to 'true' for accounts you don't want to sync.")
+            logger.info("Run the script again to begin syncing account data.")
+            logger.info("=" * 60)
+            
+            return True  # Signal to exit
+            
+        except Exception as e:
+            logger.error(f"Error checking for new accounts: {e}")
+            raise
+    
+    def _ensure_index_sheet_exists(self):
+        """
+        Ensure Index sheet exists, create if it doesn't
+        """
+        try:
+            sheets = self.sheets.get_all_sheets()
+            index_exists = any(s.get('properties', {}).get('title') == 'Index' for s in sheets)
+            
+            if not index_exists:
+                logger.info("Index sheet does not exist, creating it now")
+                self.sheets.create_sheet('Index')
+                time.sleep(1)
+                
+                # Create header row
+                header_data = [['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Ignore', 'Last Updated']]
+                self.sheets.update_sheet_data('Index', header_data)
+                
+                # Format header with green background and white text
+                try:
+                    time.sleep(0.5)
+                    sheets = self.sheets.get_all_sheets()
+                    sheet_id = None
+                    
+                    for sheet in sheets:
+                        if sheet['properties']['title'] == 'Index':
+                            sheet_id = sheet['properties']['sheetId']
+                            break
+                    
+                    if sheet_id is not None:
+                        requests = [
+                            # Green background with white text
+                            {
+                                'repeatCell': {
+                                    'range': {
+                                        'sheetId': sheet_id,
+                                        'startRowIndex': 0,
+                                        'endRowIndex': 1,
+                                        'startColumnIndex': 0,
+                                        'endColumnIndex': 6
+                                    },
+                                    'cell': {
+                                        'userEnteredFormat': {
+                                            'backgroundColor': {
+                                                'red': 0.0,
+                                                'green': 0.5,
+                                                'blue': 0.0
+                                            },
+                                            'textFormat': {
+                                                'bold': True,
+                                                'foregroundColor': {
+                                                    'red': 1.0,
+                                                    'green': 1.0,
+                                                    'blue': 1.0
+                                                }
+                                            }
+                                        }
+                                    },
+                                    'fields': 'userEnteredFormat(backgroundColor,textFormat)'
+                                }
+                            },
+                            # Freeze header row
+                            {
+                                'updateSheetProperties': {
+                                    'properties': {
+                                        'sheetId': sheet_id,
+                                        'gridProperties': {
+                                            'frozenRowCount': 1
+                                        }
+                                    },
+                                    'fields': 'gridProperties.frozenRowCount'
+                                }
+                            }
+                        ]
+                        
+                        body = {'requests': requests}
+                        self.sheets.service.spreadsheets().batchUpdate(
+                            spreadsheetId=self.sheets.spreadsheet_id,
+                            body=body
+                        ).execute()
+                except Exception as e:
+                    logger.warning(f"Could not format Index header: {e}")
+                
+                logger.info("Created empty Index sheet")
+            else:
+                logger.info("Index sheet already exists")
+                
+        except Exception as e:
+            logger.error(f"Error ensuring Index sheet exists: {e}")
+            raise
+    
+    def _update_index_sheet(self, accounts_info: List[Dict[str, Any]], existing_index: Dict[str, Dict[str, Any]]):
+        """
+        Update or create the Index sheet with account information
+        
+        Args:
+            accounts_info: List of dicts with account_name, account_id, balance, sheet_name, ignore
+            existing_index: Existing index data to preserve ignore flags
+        """
+        try:
+            # Prepare data with hyperlinks
+            data = []
+            data.append(['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Ignore', 'Last Updated'])
+            
+            for info in accounts_info:
+                account_id = info['account_id']
+                account_name = info['account_name']
+                sheet_name = info['sheet_name']
+                
+                # Preserve existing ignore flag if account exists in index
+                if account_id in existing_index:
+                    ignore_flag = existing_index[account_id].get('ignore', False)
+                else:
+                    # Default to false for new accounts
+                    ignore_flag = info.get('ignore', False)
+                
+                # Create hyperlink formula for account name
+                if sheet_name:
+                    # Formula: =HYPERLINK("#gid=SHEET_ID", "Display Text")
+                    # We'll use sheet name reference instead since we don't have sheet ID here
+                    account_name_formula = f'=HYPERLINK("#gid=0&range=\'{sheet_name}\'!A1", "{account_name}")'
+                else:
+                    account_name_formula = account_name
+                
+                data.append([
+                    account_name_formula,
+                    account_id,
+                    info['balance'],
+                    sheet_name,
+                    str(ignore_flag).lower(),
+                    datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                ])
+            
+            # Update Index sheet
+            time.sleep(1)  # Rate limiting
+            range_name = "'Index'!A1"
+            
+            # Clear existing content first
+            self.sheets.service.spreadsheets().values().clear(
+                spreadsheetId=self.sheets.spreadsheet_id,
+                range="'Index'!A:Z"
+            ).execute()
+            
+            time.sleep(0.5)
+            
+            # Write new data with formulas
+            body = {
+                'values': data
+            }
+            
+            self.sheets.service.spreadsheets().values().update(
+                spreadsheetId=self.sheets.spreadsheet_id,
+                range=range_name,
+                valueInputOption='USER_ENTERED',  # Important: USER_ENTERED processes formulas
+                body=body
+            ).execute()
+            
+            # Format header
+            self.sheets.format_sheet_header('Index')
+            
+            # Format Index header with green background and white text
+            try:
+                time.sleep(0.5)
+                sheets = self.sheets.get_all_sheets()
+                sheet_id = None
+                
+                for sheet in sheets:
+                    if sheet['properties']['title'] == 'Index':
+                        sheet_id = sheet['properties']['sheetId']
+                        break
+                
+                if sheet_id is not None:
+                    # Count number of accounts for table range
+                    num_rows = len(accounts_info) + 1  # +1 for header
+                    
+                    requests = [
+                        # Format header row with green background and white text
+                        {
+                            'repeatCell': {
+                                'range': {
+                                    'sheetId': sheet_id,
+                                    'startRowIndex': 0,
+                                    'endRowIndex': 1,
+                                    'startColumnIndex': 0,
+                                    'endColumnIndex': 6
+                                },
+                                'cell': {
+                                    'userEnteredFormat': {
+                                        'backgroundColor': {
+                                            'red': 0.0,
+                                            'green': 0.5,
+                                            'blue': 0.0
+                                        },
+                                        'textFormat': {
+                                            'bold': True,
+                                            'foregroundColor': {
+                                                'red': 1.0,
+                                                'green': 1.0,
+                                                'blue': 1.0
+                                            }
+                                        }
+                                    }
+                                },
+                                'fields': 'userEnteredFormat(backgroundColor,textFormat)'
+                            }
+                        },
+                        # Add borders to create table appearance
+                        {
+                            'updateBorders': {
+                                'range': {
+                                    'sheetId': sheet_id,
+                                    'startRowIndex': 0,
+                                    'endRowIndex': num_rows,
+                                    'startColumnIndex': 0,
+                                    'endColumnIndex': 6
+                                },
+                                'top': {'style': 'SOLID', 'width': 1},
+                                'bottom': {'style': 'SOLID', 'width': 1},
+                                'left': {'style': 'SOLID', 'width': 1},
+                                'right': {'style': 'SOLID', 'width': 1},
+                                'innerHorizontal': {'style': 'SOLID', 'width': 1},
+                                'innerVertical': {'style': 'SOLID', 'width': 1}
+                            }
+                        },
+                        # Freeze header row
+                        {
+                            'updateSheetProperties': {
+                                'properties': {
+                                    'sheetId': sheet_id,
+                                    'gridProperties': {
+                                        'frozenRowCount': 1
+                                    }
+                                },
+                                'fields': 'gridProperties.frozenRowCount'
+                            }
+                        }
+                    ]
+                    
+                    body = {'requests': requests}
+                    self.sheets.service.spreadsheets().batchUpdate(
+                        spreadsheetId=self.sheets.spreadsheet_id,
+                        body=body
+                    ).execute()
+            except Exception as e:
+                logger.warning(f"Could not format Index header: {e}")
+            
+            logger.info("Updated Index sheet successfully")
+            
+        except Exception as e:
+            logger.error(f"Error updating Index sheet: {e}")
+            raise
+    
+    def _prepare_account_data(self, account: Dict[str, Any], transactions: List[Dict[str, Any]]) -> List[List[Any]]:
+        """
+        Prepare account data for Google Sheets
+        
+        Args:
+            account: Account information from SimpleFin
+            transactions: List of transactions for this account
+            
+        Returns:
+            2D list formatted for Google Sheets
+        """
+        data = []
+        
+        # Account information section
+        data.append(['Account Information'])
+        data.append(['Account ID:', account.get('id', '')])
+        data.append(['Account Name:', account.get('name', '')])
+        data.append(['Currency:', account.get('currency', 'USD')])
+        data.append(['Balance:', account.get('balance', '')])
+        data.append(['Available Balance:', account.get('available-balance', '')])
+        data.append(['Balance Date:', account.get('balance-date', '')])
+        data.append(['Organization:', account.get('org', {}).get('name', '')])
+        data.append([])  # Empty row
+        
+        # Transactions section
+        data.append(['Transactions (Last 60 Days)'])
+        data.append([])  # Empty row
+        
+        # Transaction headers
+        data.append(['Date', 'Description', 'Amount', 'Transaction ID', 'Pending'])
+        
+        # Sort transactions by date (newest first)
+        sorted_transactions = sorted(
+            transactions,
+            key=lambda x: x.get('posted', 0),
+            reverse=True
+        )
+        
+        # Add transaction rows
+        for txn in sorted_transactions:
+            posted_date = txn.get('posted', '')
+            description = txn.get('description', '')
+            amount = txn.get('amount', '')
+            txn_id = txn.get('id', '')
+            pending = 'Yes' if txn.get('pending', False) else 'No'
+            
+            # Convert Unix timestamp to Google Sheets date formula
+            if posted_date:
+                date_formula = f'=EPOCHTODATE({posted_date})'
+            else:
+                date_formula = ''
+            
+            data.append([date_formula, description, amount, txn_id, pending])
+        
+        # Add back link to Index at the bottom
+        data.append([])  # Empty row
+        data.append([])  # Another empty row for spacing
+        data.append(['=HYPERLINK("#gid=0&range=Index!A1", "← Back to Index")'])
+        
+        return data
+    
+    def sync(self):
+        """Main synchronization process"""
+        try:
+            logger.info("Starting SimpleFin to Google Sheets synchronization")
+            
+            # Step 1: Ensure Index sheet exists
+            self._ensure_index_sheet_exists()
+            
+            # Step 2: Check if Index is empty (initial setup needed)
+            if self._is_index_empty():
+                logger.info("Index sheet is empty - running initial setup")
+                self._initial_setup()
+                return  # Exit after initial setup
+            
+            # Step 3: Read Index sheet to get existing mappings and ignore flags
+            logger.info("Reading Index sheet")
+            index_data = self._get_index_data()
+            
+            if not index_data:
+                logger.warning("Index sheet exists but contains no valid data")
+                return
+            
+            logger.info(f"Loaded {len(index_data)} accounts from Index")
+            
+            # Step 4: Check for new accounts in SimpleFin
+            new_accounts_added = self._check_and_add_new_accounts(index_data)
+            
+            if new_accounts_added:
+                # New accounts were added, exit to let user review
+                return
+            
+            # Step 5: Determine which accounts need updating
+            accounts_to_update = []
+            accounts_to_skip = []
+            
+            for account_id, account_info in index_data.items():
+                if account_info.get('ignore', False):
+                    accounts_to_skip.append((account_id, account_info))
+                else:
+                    accounts_to_update.append((account_id, account_info))
+            
+            logger.info(f"Processing {len(accounts_to_update)} accounts, skipping {len(accounts_to_skip)} ignored accounts")
+            
+            # Step 5: Process accounts to update ONE AT A TIME (alternating APIs)
+            all_accounts_info = []
+            
+            for account_id, index_info in accounts_to_update:
+                account_name = index_info.get('account_name', 'Unknown Account')
+                logger.info(f"\n{'='*60}")
+                logger.info(f"Processing account: {account_name} (ID: {account_id})")
+                logger.info(f"{'='*60}")
+                
+                # Fetch data from SimpleFin for this ONE account
+                end_date = datetime.now()
+                start_date = end_date - timedelta(days=60)
+                
+                logger.info(f"[SimpleFin API] Fetching transactions for {account_name}")
+                accounts_data = self.simplefin.get_transactions(start_date, end_date)
+                
+                # Find this specific account in the response
+                account = None
+                for acc in accounts_data.get('accounts', []):
+                    if acc.get('id') == account_id:
+                        account = acc
+                        break
+                
+                if not account:
+                    logger.warning(f"Account {account_id} not found in SimpleFin response, skipping")
+                    continue
+                
+                balance = account.get('balance', '')
+                
+                # Get sheet name from Index
+                sheet_name = index_info.get('sheet_name', '')
+                
+                if not sheet_name:
+                    # No sheet name in index, create one
+                    base_name = account_name.replace('/', '-').replace('\\', '-')[:100]
+                    sheet_name = self.sheets.find_unique_sheet_name(base_name, account_id)
+                
+                # Check if sheet exists, create if needed
+                sheets = self.sheets.get_all_sheets()
+                sheet_exists = any(s.get('properties', {}).get('title') == sheet_name for s in sheets)
+                
+                if not sheet_exists:
+                    logger.info(f"[Google Sheets API] Creating new sheet: {sheet_name}")
+                    self.sheets.create_sheet(sheet_name)
+                else:
+                    logger.info(f"[Google Sheets API] Sheet exists: {sheet_name}")
+                    # Make sure sheet is not hidden
+                    self.sheets.unhide_sheet(sheet_name)
+                
+                # Prepare data
+                transactions = account.get('transactions', [])
+                logger.info(f"Preparing data for {len(transactions)} transactions")
+                data = self._prepare_account_data(account, transactions)
+                
+                # Update Google Sheet for this account
+                logger.info(f"[Google Sheets API] Updating sheet '{sheet_name}'")
+                self.sheets.update_sheet_data(sheet_name, data)
+                
+                logger.info(f"[Google Sheets API] Formatting sheet '{sheet_name}'")
+                self.sheets.format_sheet_header(sheet_name)
+                
+                # Set column B width to 400 pixels
+                logger.info(f"[Google Sheets API] Setting column width for '{sheet_name}'")
+                self.sheets.set_column_width(sheet_name, 1, 400)
+                
+                logger.info(f"[SUCCESS] Successfully synced account: {account_name}")
+                
+                # Track for Index update
+                all_accounts_info.append({
+                    'account_name': account_name,
+                    'account_id': account_id,
+                    'balance': balance,
+                    'sheet_name': sheet_name,
+                    'ignore': False
+                })
+            
+            # Step 6: Process skipped accounts (hide sheets, add to index)
+            for account_id, index_info in accounts_to_skip:
+                account_name = index_info.get('account_name', 'Unknown Account')
+                balance = index_info.get('balance', '')
+                sheet_name = index_info.get('sheet_name', '')
+                
+                logger.info(f"Skipping ignored account: {account_name}")
+                
+                if sheet_name:
+                    self.sheets.hide_sheet(sheet_name)
+                
+                all_accounts_info.append({
+                    'account_name': account_name,
+                    'account_id': account_id,
+                    'balance': balance,
+                    'sheet_name': sheet_name,
+                    'ignore': True
+                })
+            
+            # Step 7: Update Index sheet
+            logger.info("\nUpdating Index sheet with latest information")
+            self._update_index_sheet(all_accounts_info, index_data)
+            
+            logger.info("\n" + "="*60)
+            logger.info("SYNCHRONIZATION COMPLETED SUCCESSFULLY")
+            logger.info("="*60)
+            logger.info(f"Updated: {len(accounts_to_update)} accounts")
+            logger.info(f"Skipped: {len(accounts_to_skip)} accounts")
+            logger.info("="*60)
+            
+        except Exception as e:
+            logger.error(f"Error during synchronization: {e}")
+            raise
+
+
+def main():
+    """Main entry point"""
+    config_file = 'config.json'
+    
+    if not os.path.exists(config_file):
+        logger.error(f"Configuration file not found: {config_file}")
+        logger.info("Please create a config.json file with the required settings")
+        return 1
+    
+    try:
+        sync_service = SimplefinToSheetsSync(config_file)
+        sync_service.sync()
+        return 0
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        return 1
+
+
+if __name__ == '__main__':
+    exit_code = main()
+    exit(exit_code)

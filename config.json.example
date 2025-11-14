@@ -1,0 +1,5 @@
+{
+  "simplefin_token": "your-base64-encoded-simplefin-token-here",
+  "google_credentials_file": "credentials.json",
+  "spreadsheet_id": "your-google-spreadsheet-id-here"
+}
