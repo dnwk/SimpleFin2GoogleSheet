@@ -126,13 +126,13 @@ Your Banks → SimpleFin Bridge → This Script → Your Google Sheet
 ### Step 4: Install Script
 
 1. **Install Python dependencies**
-   ```powershell
+   ```bash
    pip install -r requirements.txt
    ```
 
 2. **Create configuration file**
-   ```powershell
-   Copy-Item config.json.example config.json
+   ```bash
+   cp config.json.example config.json
    ```
 
 3. **Edit config.json**
@@ -149,7 +149,7 @@ Your Banks → SimpleFin Bridge → This Script → Your Google Sheet
 ### Initial Setup
 
 1. **Run the script first time**
-   ```powershell
+   ```bash
    python simplefin_to_sheets.py
    ```
 
@@ -163,7 +163,7 @@ Your Banks → SimpleFin Bridge → This Script → Your Google Sheet
    - For accounts you don't want to sync, change **"Ignore"** column to `true`
 
 4. **Run again to sync data**
-   ```powershell
+   ```bash
    python simplefin_to_sheets.py
    ```
    - Now it will create sheets and sync transactions
@@ -171,7 +171,7 @@ Your Banks → SimpleFin Bridge → This Script → Your Google Sheet
 ### Regular Syncing
 
 **Run anytime to update:**
-```powershell
+```bash
 python simplefin_to_sheets.py
 ```
 
@@ -194,15 +194,23 @@ python simplefin_to_sheets.py
 
 ### Scheduling Automatic Updates
 
-**Windows Task Scheduler:**
-1. Open Task Scheduler
-2. Create Basic Task
-3. Set trigger (e.g., Daily at 8:00 AM)
-4. Action: Start a program
-   - Program: `python`
-   - Arguments: `C:\path\to\simplefin_to_sheets.py`
-   - Start in: `C:\path\to\script\directory`
-5. Finish
+**Using cron (Linux/Mac):**
+1. Edit your crontab:
+   ```bash
+   crontab -e
+   ```
+
+2. Add a line to run daily at 8:00 AM:
+   ```bash
+   0 8 * * * cd /path/to/script/directory && python simplefin_to_sheets.py >> /path/to/script/directory/cron.log 2>&1
+   ```
+
+3. Save and exit
+
+**Cron schedule examples:**
+- Daily at 8 AM: `0 8 * * *`
+- Every Monday at 9 AM: `0 9 * * 1`
+- Twice daily (8 AM and 8 PM): `0 8,20 * * *`
 
 **Recommended frequency**: Daily or weekly (avoid more than once per hour)
 
