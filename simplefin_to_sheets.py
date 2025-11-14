@@ -666,7 +666,11 @@ class SimplefinToSheetsSync:
             config_file: Path to configuration JSON file
         """
         self.config = self._load_config(config_file)
-        self.config_file = config_file
+        # Store the absolute path to config file for later use (e.g., saving access URL)
+        if not os.path.isabs(config_file):
+            self.config_file = os.path.join(SCRIPT_DIR, config_file)
+        else:
+            self.config_file = config_file
         
         # Get access URL from token or use cached access URL
         access_url = self._get_access_url()
@@ -792,12 +796,8 @@ class SimplefinToSheetsSync:
         try:
             self.config['simplefin_access_url'] = access_url
             
-            # Convert to absolute path relative to script directory
-            config_file_path = self.config_file
-            if not os.path.isabs(config_file_path):
-                config_file_path = os.path.join(SCRIPT_DIR, config_file_path)
-            
-            with open(config_file_path, 'w') as f:
+            # self.config_file is already an absolute path
+            with open(self.config_file, 'w') as f:
                 json.dump(self.config, f, indent=2)
             
             logger.info("Saved SimpleFin access URL to configuration file for future use")
@@ -1750,7 +1750,8 @@ class SimplefinToSheetsSync:
 
 def main():
     """Main entry point"""
-    config_file = 'config.json'
+    # Use config.json relative to script directory
+    config_file = os.path.join(SCRIPT_DIR, 'config.json')
     
     if not os.path.exists(config_file):
         logger.error(f"Configuration file not found: {config_file}")
