@@ -150,55 +150,9 @@ class SimplefinClient:
                 return f"Basic {auth_b64}"
         return ""
     
-    def get_accounts(self, max_retries: int = 3) -> Dict[str, Any]:
+    def get_accounts_with_transactions(self, start_date: datetime, end_date: Optional[datetime] = None, max_retries: int = 3) -> Dict[str, Any]:
         """
-        Fetch all accounts from SimpleFin with retry logic
-        
-        Args:
-            max_retries: Maximum number of retry attempts for timeout/connection errors
-            
-        Returns:
-            Dictionary containing accounts and their information
-        """
-        url = f"{self.base_url}/accounts"
-        headers = {'Authorization': self.auth_header} if self.auth_header else {}
-        
-        for attempt in range(max_retries):
-            try:
-                logger.info(f"Fetching accounts from SimpleFin API (attempt {attempt + 1}/{max_retries})")
-                response = requests.get(url, headers=headers, timeout=30)
-                
-                # Handle HTTP 403 - access URL is invalid or revoked
-                if response.status_code == 403:
-                    logger.error("HTTP 403 Forbidden: SimpleFin access URL is invalid or has been revoked")
-                    raise ValueError(
-                        "SimpleFin access URL is invalid or has been revoked. "
-                        "Please create a new token at https://beta-bridge.simplefin.org/my-account/tokens/create "
-                        "and update your config.json with the new token. "
-                        "Remove the old 'simplefin_access_url' from config to claim the new token."
-                    )
-                
-                response.raise_for_status()
-                
-                data = response.json()
-                logger.info(f"Successfully fetched {len(data.get('accounts', []))} accounts")
-                return data
-                
-            except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
-                if attempt < max_retries - 1:
-                    wait_time = 2 ** attempt  # Exponential backoff: 1s, 2s, 4s
-                    logger.warning(f"SimpleFin API timeout/connection error: {e}. Retrying in {wait_time} seconds...")
-                    time.sleep(wait_time)
-                else:
-                    logger.error(f"Error fetching accounts from SimpleFin after {max_retries} attempts: {e}")
-                    raise
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Error fetching accounts from SimpleFin: {e}")
-                raise
-    
-    def get_transactions(self, start_date: datetime, end_date: Optional[datetime] = None, max_retries: int = 3) -> Dict[str, Any]:
-        """
-        Fetch transactions within date range with retry logic
+        Fetch all accounts and transactions within date range with retry logic
         
         Args:
             start_date: Start date for transactions
@@ -206,7 +160,7 @@ class SimplefinClient:
             max_retries: Maximum number of retry attempts for timeout/connection errors
             
         Returns:
-            Dictionary containing accounts with transactions
+            Dictionary containing accounts with their information and transactions
         """
         if end_date is None:
             end_date = datetime.now()
@@ -224,7 +178,7 @@ class SimplefinClient:
         
         for attempt in range(max_retries):
             try:
-                logger.info(f"Fetching transactions from {start_date.date()} to {end_date.date()} (attempt {attempt + 1}/{max_retries})")
+                logger.info(f"Fetching accounts and transactions from {start_date.date()} to {end_date.date()} (attempt {attempt + 1}/{max_retries})")
                 response = requests.get(url, headers=headers, params=params, timeout=30)
                 
                 # Handle HTTP 403 - access URL is invalid or revoked
@@ -240,7 +194,7 @@ class SimplefinClient:
                 response.raise_for_status()
                 
                 data = response.json()
-                logger.info(f"Successfully fetched transactions")
+                logger.info(f"Successfully fetched {len(data.get('accounts', []))} accounts with transactions")
                 return data
                 
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
@@ -249,11 +203,16 @@ class SimplefinClient:
                     logger.warning(f"SimpleFin API timeout/connection error: {e}. Retrying in {wait_time} seconds...")
                     time.sleep(wait_time)
                 else:
-                    logger.error(f"Error fetching transactions from SimpleFin after {max_retries} attempts: {e}")
+                    logger.error(f"Error fetching accounts from SimpleFin after {max_retries} attempts: {e}")
                     raise
             except requests.exceptions.RequestException as e:
-                logger.error(f"Error fetching transactions from SimpleFin: {e}")
+                logger.error(f"Error fetching accounts from SimpleFin: {e}")
                 raise
+        
+        # Should never reach here due to raise statements, but satisfy type checker
+        return {'accounts': []}
+    
+
 
 
 class GoogleSheetsClient:
@@ -886,7 +845,10 @@ class SimplefinToSheetsSync:
             
             # Step 2: Fetch all accounts from SimpleFin
             logger.info("Fetching all accounts from SimpleFin for initial setup")
-            accounts_list = self.simplefin.get_accounts()
+            # Use a wide date range to get all accounts with minimal transaction data
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=1)  # Just need 1 day for account info
+            accounts_list = self.simplefin.get_accounts_with_transactions(start_date, end_date)
             all_accounts = accounts_list.get('accounts', [])
             
             if not all_accounts:
@@ -943,7 +905,10 @@ class SimplefinToSheetsSync:
             logger.info("Checking SimpleFin for new accounts...")
             
             # Fetch all current accounts from SimpleFin
-            accounts_list = self.simplefin.get_accounts()
+            # Use a wide date range to get all accounts with minimal transaction data
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=1)  # Just need 1 day for account info
+            accounts_list = self.simplefin.get_accounts_with_transactions(start_date, end_date)
             all_accounts = accounts_list.get('accounts', [])
             
             if not all_accounts:
@@ -1303,6 +1268,43 @@ class SimplefinToSheetsSync:
         data.append(['Organization:', account.get('org', {}).get('name', '')])
         data.append([])  # Empty row
         
+        # Holdings section (if available)
+        holdings = account.get('holdings', [])
+        if holdings:
+            data.append(['Holdings'])
+            data.append([])  # Empty row
+            
+            # Holdings headers
+            data.append(['Symbol', 'Description', 'Shares', 'Purchase Price', 'Cost Basis', 'Market Value', 'Created Date', 'Currency', 'Holding ID'])
+            
+            # Sort holdings by symbol
+            sorted_holdings = sorted(
+                holdings,
+                key=lambda x: x.get('symbol', '')
+            )
+            
+            # Add holdings rows
+            for holding in sorted_holdings:
+                symbol = holding.get('symbol', '')
+                description = holding.get('description', '')
+                shares = holding.get('shares', '')
+                purchase_price = holding.get('purchase_price', '')
+                cost_basis = holding.get('cost_basis', '')
+                market_value = holding.get('market_value', '')
+                created = holding.get('created', '')
+                currency = holding.get('currency', 'USD')
+                holding_id = holding.get('id', '')
+                
+                # Convert Unix timestamp to Google Sheets date formula
+                if created:
+                    created_formula = f'=EPOCHTODATE({created})'
+                else:
+                    created_formula = ''
+                
+                data.append([symbol, description, shares, purchase_price, cost_basis, market_value, created_formula, currency, holding_id])
+            
+            data.append([])  # Empty row after holdings
+        
         # Transactions section
         data.append(['Transactions (Last 60 Days)'])
         data.append([])  # Empty row
@@ -1384,7 +1386,21 @@ class SimplefinToSheetsSync:
             
             logger.info(f"Processing {len(accounts_to_update)} accounts, skipping {len(accounts_to_skip)} ignored accounts")
             
-            # Step 5: Process accounts to update ONE AT A TIME (alternating APIs)
+            # Step 5: Fetch ALL accounts and transactions in ONE API call
+            end_date = datetime.now()
+            start_date = end_date - timedelta(days=60)
+            
+            logger.info(f"\n{'='*60}")
+            logger.info(f"[SimpleFin API] Fetching all accounts and transactions in one call")
+            logger.info(f"{'='*60}")
+            accounts_data = self.simplefin.get_accounts_with_transactions(start_date, end_date)
+            
+            # Create a map of account_id -> account data for quick lookup
+            accounts_map = {}
+            for acc in accounts_data.get('accounts', []):
+                accounts_map[acc.get('id')] = acc
+            
+            # Step 6: Process each account for sheet updates
             all_accounts_info = []
             
             for account_id, index_info in accounts_to_update:
@@ -1393,19 +1409,8 @@ class SimplefinToSheetsSync:
                 logger.info(f"Processing account: {account_name} (ID: {account_id})")
                 logger.info(f"{'='*60}")
                 
-                # Fetch data from SimpleFin for this ONE account
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=60)
-                
-                logger.info(f"[SimpleFin API] Fetching transactions for {account_name}")
-                accounts_data = self.simplefin.get_transactions(start_date, end_date)
-                
-                # Find this specific account in the response
-                account = None
-                for acc in accounts_data.get('accounts', []):
-                    if acc.get('id') == account_id:
-                        account = acc
-                        break
+                # Get account data from the map
+                account = accounts_map.get(account_id)
                 
                 if not account:
                     logger.warning(f"Account {account_id} not found in SimpleFin response, skipping")
@@ -1475,7 +1480,7 @@ class SimplefinToSheetsSync:
                     'ignore': False
                 })
             
-            # Step 6: Process skipped accounts (hide sheets, add to index)
+            # Step 7: Process skipped accounts (hide sheets, add to index)
             for account_id, index_info in accounts_to_skip:
                 account_name = index_info.get('account_name', 'Unknown Account')
                 balance = index_info.get('balance', '')
@@ -1494,7 +1499,7 @@ class SimplefinToSheetsSync:
                     'ignore': True
                 })
             
-            # Step 7: Update Index sheet
+            # Step 8: Update Index sheet
             logger.info("\nUpdating Index sheet with latest information")
             self._update_index_sheet(all_accounts_info, index_data)
             
