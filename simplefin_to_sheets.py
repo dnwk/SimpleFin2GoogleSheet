@@ -651,6 +651,17 @@ class SimplefinToSheetsSync:
             if 'simplefin_token' not in config and 'simplefin_access_url' not in config:
                 raise ValueError("Configuration must contain either 'simplefin_token' or 'simplefin_access_url'")
             
+            # Validate transaction_days (optional, default to 60, max 180)
+            transaction_days = config.get('transaction_days', 60)
+            if not isinstance(transaction_days, int) or transaction_days < 1:
+                logger.warning(f"Invalid transaction_days value: {transaction_days}. Using default: 60")
+                config['transaction_days'] = 60
+            elif transaction_days > 180:
+                logger.warning(f"transaction_days ({transaction_days}) exceeds maximum of 180 days. Using 180.")
+                config['transaction_days'] = 180
+            else:
+                config['transaction_days'] = transaction_days
+            
             return config
             
         except Exception as e:
@@ -1244,13 +1255,14 @@ class SimplefinToSheetsSync:
             logger.error(f"Error updating Index sheet: {e}")
             raise
     
-    def _prepare_account_data(self, account: Dict[str, Any], transactions: List[Dict[str, Any]]) -> List[List[Any]]:
+    def _prepare_account_data(self, account: Dict[str, Any], transactions: List[Dict[str, Any]], transaction_days: int = 60) -> List[List[Any]]:
         """
         Prepare account data for Google Sheets
         
         Args:
             account: Account information from SimpleFin
             transactions: List of transactions for this account
+            transaction_days: Number of days of transactions included
             
         Returns:
             2D list formatted for Google Sheets
@@ -1306,7 +1318,7 @@ class SimplefinToSheetsSync:
             data.append([])  # Empty row after holdings
         
         # Transactions section
-        data.append(['Transactions (Last 60 Days)'])
+        data.append([f'Transactions (Last {transaction_days} Days)'])
         data.append([])  # Empty row
         
         # Transaction headers
@@ -1387,11 +1399,13 @@ class SimplefinToSheetsSync:
             logger.info(f"Processing {len(accounts_to_update)} accounts, skipping {len(accounts_to_skip)} ignored accounts")
             
             # Step 5: Fetch ALL accounts and transactions in ONE API call
+            transaction_days = self.config.get('transaction_days', 60)
             end_date = datetime.now()
-            start_date = end_date - timedelta(days=60)
+            start_date = end_date - timedelta(days=transaction_days)
             
             logger.info(f"\n{'='*60}")
             logger.info(f"[SimpleFin API] Fetching all accounts and transactions in one call")
+            logger.info(f"[SimpleFin API] Transaction range: {transaction_days} days")
             logger.info(f"{'='*60}")
             accounts_data = self.simplefin.get_accounts_with_transactions(start_date, end_date)
             
@@ -1441,7 +1455,7 @@ class SimplefinToSheetsSync:
                 # Prepare data
                 transactions = account.get('transactions', [])
                 logger.info(f"Preparing data for {len(transactions)} transactions")
-                data = self._prepare_account_data(account, transactions)
+                data = self._prepare_account_data(account, transactions, transaction_days)
                 
                 # Get Index sheet GID for back link
                 index_gid = self.sheets.get_sheet_gid('Index')

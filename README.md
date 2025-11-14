@@ -8,7 +8,7 @@ Connect your banks through SimpleFin Bridge and this script will automatically p
 
 - 🏦 Aggregates **all your bank accounts** into one Google Sheet
 - 💰 Updates **current balances** automatically
-- 📊 Pulls **last 60 days of transactions** for each account
+- 📊 Pulls **transactions** for each account (configurable: 1-180 days, default 60)
 - 🔄 Detects **new accounts** automatically
 - ✅ Lets you **choose which accounts to sync** (ignore unwanted ones)
 - 🔗 Creates **clickable navigation** between accounts
@@ -140,9 +140,19 @@ Your Banks → SimpleFin Bridge → This Script → Your Google Sheet
    {
      "simplefin_token": "paste-your-base64-token-here",
      "google_credentials_file": "credentials.json",
-     "spreadsheet_id": "paste-your-spreadsheet-id-here"
+     "spreadsheet_id": "paste-your-spreadsheet-id-here",
+     "transaction_days": 60
    }
    ```
+
+   **Configuration Options:**
+   - `simplefin_token`: Your SimpleFin setup token (base64-encoded)
+   - `google_credentials_file`: Path to your Google service account JSON file
+   - `spreadsheet_id`: Your Google Spreadsheet ID from the URL
+   - `transaction_days`: (Optional) Number of days of transactions to fetch
+     - Default: 60 days
+     - Range: 1-180 days
+     - Higher values = more data but slower syncs
 
 ## Usage
 
