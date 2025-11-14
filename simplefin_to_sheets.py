@@ -31,7 +31,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def retry_on_rate_limit(max_retries=5, initial_delay=1):
+def retry_on_rate_limit(max_retries=5, initial_delay=10):
     """
     Decorator to retry API calls on rate limit errors with exponential backoff
     
@@ -241,11 +241,11 @@ class GoogleSheetsClient:
             logger.error(f"Error authenticating with Google Sheets: {e}")
             raise
     
-    @retry_on_rate_limit(max_retries=5, initial_delay=2)
+    @retry_on_rate_limit(max_retries=5, initial_delay=10)
     def get_all_sheets(self) -> List[Dict[str, Any]]:
         """Get all sheets in the spreadsheet"""
         try:
-            time.sleep(0.5)  # Add small delay between requests
+            time.sleep(1)  # Throttle to stay under 60 req/min
             spreadsheet = self.service.spreadsheets().get(
                 spreadsheetId=self.spreadsheet_id
             ).execute()
@@ -266,7 +266,7 @@ class GoogleSheetsClient:
             logger.warning(f"Error getting sheet GID for '{sheet_name}': {e}")
             return None
     
-    @retry_on_rate_limit(max_retries=5, initial_delay=2)
+    @retry_on_rate_limit(max_retries=5, initial_delay=10)
     def find_sheet_by_account_id(self, account_id: str) -> Optional[Dict[str, Any]]:
         """
         Find sheet by account ID stored in the sheet
@@ -292,7 +292,7 @@ class GoogleSheetsClient:
                 
                 # Read account ID from cell A2
                 try:
-                    time.sleep(0.5)  # Rate limiting between reads
+                    time.sleep(1)  # Throttle to stay under 60 req/min
                     range_name = f"'{sheet_name}'!A2"
                     result = self.service.spreadsheets().values().get(
                         spreadsheetId=self.spreadsheet_id,
@@ -339,7 +339,7 @@ class GoogleSheetsClient:
                     
                 # Try to read account ID from this sheet
                 try:
-                    time.sleep(0.3)  # Rate limiting
+                    time.sleep(1)  # Throttle to stay under 60 req/min
                     range_name = f"'{sheet_name}'!A2"
                     result = self.service.spreadsheets().values().get(
                         spreadsheetId=self.spreadsheet_id,
@@ -378,7 +378,7 @@ class GoogleSheetsClient:
             logger.warning(f"Error finding unique sheet name, using base name: {e}")
             return base_name
     
-    @retry_on_rate_limit(max_retries=5, initial_delay=2)
+    @retry_on_rate_limit(max_retries=5, initial_delay=10)
     def create_sheet(self, sheet_name: str) -> int:
         """
         Create a new sheet
@@ -390,7 +390,7 @@ class GoogleSheetsClient:
             Sheet ID of the created sheet
         """
         try:
-            time.sleep(1)  # Rate limiting before write operation
+            time.sleep(1.5)  # Throttle write operations more
             request_body = {
                 'requests': [{
                     'addSheet': {
@@ -414,7 +414,7 @@ class GoogleSheetsClient:
             logger.error(f"Error creating sheet: {e}")
             raise
     
-    @retry_on_rate_limit(max_retries=5, initial_delay=2)
+    @retry_on_rate_limit(max_retries=5, initial_delay=10)
     def update_sheet_data(self, sheet_name: str, data: List[List[Any]]):
         """
         Update sheet with data (overwrites existing content)
@@ -424,7 +424,7 @@ class GoogleSheetsClient:
             data: 2D list of values to write
         """
         try:
-            time.sleep(1)  # Rate limiting before write operation
+            time.sleep(1.5)  # Throttle write operations more
             range_name = f"'{sheet_name}'!A1"
             
             # Clear existing content first
@@ -433,7 +433,7 @@ class GoogleSheetsClient:
                 range=f"'{sheet_name}'!A:Z"
             ).execute()
             
-            time.sleep(0.5)  # Small delay between clear and update
+            time.sleep(1)  # Delay between clear and update
             
             # Write new data
             body = {
@@ -503,11 +503,11 @@ class GoogleSheetsClient:
         except HttpError as e:
             logger.error(f"Error formatting sheet: {e}")
     
-    @retry_on_rate_limit(max_retries=5, initial_delay=2)
+    @retry_on_rate_limit(max_retries=5, initial_delay=10)
     def set_column_width(self, sheet_name: str, column_index: int, width_pixels: int):
         """Set the width of a specific column"""
         try:
-            time.sleep(0.5)
+            time.sleep(1)  # Throttle to stay under 60 req/min
             sheets = self.get_all_sheets()
             sheet_id = None
             
@@ -543,11 +543,11 @@ class GoogleSheetsClient:
         except HttpError as e:
             logger.error(f"Error setting column width: {e}")
     
-    @retry_on_rate_limit(max_retries=5, initial_delay=2)
+    @retry_on_rate_limit(max_retries=5, initial_delay=10)
     def hide_sheet(self, sheet_name: str):
         """Hide a sheet"""
         try:
-            time.sleep(0.5)
+            time.sleep(1)  # Throttle to stay under 60 req/min
             sheets = self.get_all_sheets()
             sheet_id = None
             
@@ -578,11 +578,11 @@ class GoogleSheetsClient:
         except HttpError as e:
             logger.error(f"Error hiding sheet: {e}")
     
-    @retry_on_rate_limit(max_retries=5, initial_delay=2)
+    @retry_on_rate_limit(max_retries=5, initial_delay=10)
     def unhide_sheet(self, sheet_name: str):
         """Unhide a sheet"""
         try:
-            time.sleep(0.5)
+            time.sleep(1)  # Throttle to stay under 60 req/min
             sheets = self.get_all_sheets()
             sheet_id = None
             
@@ -725,7 +725,7 @@ class SimplefinToSheetsSync:
             
             # Try to read Index sheet
             try:
-                time.sleep(0.5)
+                time.sleep(1)  # Throttle to stay under 60 req/min
                 result = self.sheets.service.spreadsheets().values().get(
                     spreadsheetId=self.sheets.spreadsheet_id,
                     range="'Index'!A2:F1000"  # Read all data rows
@@ -773,7 +773,7 @@ class SimplefinToSheetsSync:
             True if Index is empty/new, False if it contains data
         """
         try:
-            time.sleep(0.5)
+            time.sleep(1)  # Throttle to stay under 60 req/min
             result = self.sheets.service.spreadsheets().values().get(
                 spreadsheetId=self.sheets.spreadsheet_id,
                 range="'Index'!A2:B2"  # Check if there's any data in row 2
@@ -815,7 +815,7 @@ class SimplefinToSheetsSync:
                 # Delete in batches to avoid rate limits
                 for sheet_id in sheets_to_delete:
                     try:
-                        time.sleep(0.5)  # Rate limiting
+                        time.sleep(1.5)  # Throttle delete operations
                         requests = [{
                             'deleteSheet': {
                                 'sheetId': sheet_id
@@ -1011,7 +1011,7 @@ class SimplefinToSheetsSync:
             if not index_exists:
                 logger.info("Index sheet does not exist, creating it now")
                 self.sheets.create_sheet('Index')
-                time.sleep(1)
+                time.sleep(1.5)  # Wait after creation
                 
                 # Create header row
                 header_data = [['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Ignore', 'Last Updated']]
@@ -1019,7 +1019,7 @@ class SimplefinToSheetsSync:
                 
                 # Format header with green background and white text
                 try:
-                    time.sleep(0.5)
+                    time.sleep(1)  # Throttle to stay under 60 req/min
                     sheets = self.sheets.get_all_sheets()
                     sheet_id = None
                     
@@ -1137,7 +1137,7 @@ class SimplefinToSheetsSync:
                 ])
             
             # Update Index sheet
-            time.sleep(1)  # Rate limiting
+            time.sleep(1.5)  # Throttle write operations
             range_name = "'Index'!A1"
             
             # Clear existing content first
@@ -1146,7 +1146,7 @@ class SimplefinToSheetsSync:
                 range="'Index'!A:Z"
             ).execute()
             
-            time.sleep(0.5)
+            time.sleep(1)  # Delay between clear and update
             
             # Write new data with formulas
             body = {
@@ -1165,7 +1165,7 @@ class SimplefinToSheetsSync:
             
             # Format Index header with green background and white text
             try:
-                time.sleep(0.5)
+                time.sleep(1)  # Throttle to stay under 60 req/min
                 sheets = self.sheets.get_all_sheets()
                 sheet_id = None
                 
