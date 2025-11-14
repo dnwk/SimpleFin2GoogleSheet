@@ -670,6 +670,46 @@ class SimplefinToSheetsSync:
             self.config['spreadsheet_id']
         )
     
+    @staticmethod
+    def _parse_simplefin_errors(accounts_data: Dict[str, Any]) -> List[str]:
+        """
+        Parse errors from SimpleFin API response to extract organization names
+        that need attention.
+        
+        Args:
+            accounts_data: Response from SimpleFin API
+            
+        Returns:
+            List of organization names that have connection errors
+        """
+        error_orgs = []
+        errors = accounts_data.get('errors', [])
+        
+        if not errors:
+            return error_orgs
+        
+        logger.info(f"Found {len(errors)} error(s) in SimpleFin response")
+        
+        for error_msg in errors:
+            if not isinstance(error_msg, str):
+                continue
+            
+            # Parse: "Connection to [ORG NAME] may need attention..."
+            if 'Connection to' in error_msg and 'may need attention' in error_msg:
+                try:
+                    # Extract text between "Connection to" and "may need attention"
+                    start = error_msg.index('Connection to') + len('Connection to')
+                    end = error_msg.index('may need attention')
+                    org_name = error_msg[start:end].strip()
+                    
+                    if org_name:
+                        error_orgs.append(org_name)
+                        logger.warning(f"Connection error detected for: {org_name}")
+                except (ValueError, IndexError) as e:
+                    logger.warning(f"Could not parse error message: {error_msg}")
+        
+        return error_orgs
+    
     def _load_config(self, config_file: str) -> Dict[str, Any]:
         """Load configuration from JSON file"""
         try:
@@ -762,7 +802,7 @@ class SimplefinToSheetsSync:
                 time.sleep(1)  # Throttle to stay under 60 req/min
                 result = self.sheets.service.spreadsheets().values().get(
                     spreadsheetId=self.sheets.spreadsheet_id,
-                    range="'Index'!A2:F1000"  # Read all data rows
+                    range="'Index'!A2:G1000"  # Read all data rows including Connection Status
                 ).execute()
                 
                 values = result.get('values', [])
@@ -775,13 +815,16 @@ class SimplefinToSheetsSync:
                         # Default to false if not specified or invalid
                         ignore_str = row[4].strip().lower() if len(row) > 4 and row[4] else 'false'
                         ignore = ignore_str == 'true'
-                        last_updated = row[5] if len(row) > 5 else ''
+                        # Connection status in column F (index 5)
+                        connection_status = row[5] if len(row) > 5 else ''
+                        last_updated = row[6] if len(row) > 6 else ''
                         
                         index_map[account_id] = {
                             'account_name': account_name,
                             'sheet_name': sheet_name,
                             'balance': balance,
                             'ignore': ignore,
+                            'org_name': '',  # Will be updated from SimpleFin data
                             'last_updated': last_updated
                         }
                 
@@ -908,6 +951,7 @@ class SimplefinToSheetsSync:
                 account_id = account.get('id', '')
                 account_name = account.get('name', 'Unknown Account')
                 balance = account.get('balance', '')
+                org_name = account.get('org', {}).get('name', '')
                 
                 # Generate sheet name (sanitized account name)
                 base_name = account_name.replace('/', '-').replace('\\', '-')[:100]
@@ -917,6 +961,7 @@ class SimplefinToSheetsSync:
                     'account_id': account_id,
                     'balance': balance,
                     'sheet_name': base_name,  # Will be finalized when sheets are created
+                    'org_name': org_name,
                     'ignore': False  # Default to false
                 })
             
@@ -985,6 +1030,7 @@ class SimplefinToSheetsSync:
                 account_id = account.get('id', '')
                 account_name = account.get('name', 'Unknown Account')
                 balance = account.get('balance', '')
+                org_name = account.get('org', {}).get('name', '')
                 
                 # Generate unique sheet name
                 base_name = account_name.replace('/', '-').replace('\\', '-')[:100]
@@ -997,6 +1043,7 @@ class SimplefinToSheetsSync:
                     'account_id': account_id,
                     'balance': balance,
                     'sheet_name': sheet_name,
+                    'org_name': org_name,
                     'ignore': False  # Default to false for new accounts
                 })
             
@@ -1010,6 +1057,7 @@ class SimplefinToSheetsSync:
                     'account_id': account_id,
                     'balance': info.get('balance', ''),
                     'sheet_name': info.get('sheet_name', ''),
+                    'org_name': info.get('org_name', ''),
                     'ignore': info.get('ignore', False)
                 })
             
@@ -1048,7 +1096,7 @@ class SimplefinToSheetsSync:
                 time.sleep(1.5)  # Wait after creation
                 
                 # Create header row
-                header_data = [['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Ignore', 'Last Updated']]
+                header_data = [['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Ignore', 'Connection Status', 'Last Updated']]
                 self.sheets.update_sheet_data('Index', header_data)
                 
                 # Format header with green background and white text
@@ -1072,7 +1120,7 @@ class SimplefinToSheetsSync:
                                         'startRowIndex': 0,
                                         'endRowIndex': 1,
                                         'startColumnIndex': 0,
-                                        'endColumnIndex': 6
+                                        'endColumnIndex': 7
                                     },
                                     'cell': {
                                         'userEnteredFormat': {
@@ -1124,18 +1172,21 @@ class SimplefinToSheetsSync:
             logger.error(f"Error ensuring Index sheet exists: {e}")
             raise
     
-    def _update_index_sheet(self, accounts_info: List[Dict[str, Any]], existing_index: Dict[str, Dict[str, Any]]):
+    def _update_index_sheet(self, accounts_info: List[Dict[str, Any]], existing_index: Dict[str, Dict[str, Any]], error_orgs: Optional[List[str]] = None):
         """
         Update or create the Index sheet with account information
         
         Args:
-            accounts_info: List of dicts with account_name, account_id, balance, sheet_name, ignore
+            accounts_info: List of dicts with account_name, account_id, balance, sheet_name, ignore, org_name
             existing_index: Existing index data to preserve ignore flags
+            error_orgs: List of organization names with connection errors
         """
         try:
+            if error_orgs is None:
+                error_orgs = []
             # Prepare data with hyperlinks
             data = []
-            data.append(['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Ignore', 'Last Updated'])
+            data.append(['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Ignore', 'Connection Status', 'Last Updated'])
             
             for info in accounts_info:
                 account_id = info['account_id']
@@ -1162,12 +1213,19 @@ class SimplefinToSheetsSync:
                 else:
                     account_name_formula = self.sheets.sanitize_string(account_name)
                 
+                # Check if account's org is in error list
+                org_name = info.get('org_name', '')
+                connection_status = ''
+                if org_name and org_name in error_orgs:
+                    connection_status = 'Connection broken. Attention required'
+                
                 data.append([
                     account_name_formula,
                     account_id,
                     info['balance'],
                     sheet_name,
                     str(ignore_flag).lower(),
+                    connection_status,
                     datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                 ])
             
@@ -1222,7 +1280,7 @@ class SimplefinToSheetsSync:
                                     'startRowIndex': 0,
                                     'endRowIndex': 1,
                                     'startColumnIndex': 0,
-                                    'endColumnIndex': 6
+                                    'endColumnIndex': 7
                                 },
                                 'cell': {
                                     'userEnteredFormat': {
@@ -1252,7 +1310,7 @@ class SimplefinToSheetsSync:
                                     'startRowIndex': 0,
                                     'endRowIndex': num_rows,
                                     'startColumnIndex': 0,
-                                    'endColumnIndex': 6
+                                    'endColumnIndex': 7
                                 },
                                 'top': {'style': 'SOLID', 'width': 1},
                                 'bottom': {'style': 'SOLID', 'width': 1},
@@ -1444,6 +1502,9 @@ class SimplefinToSheetsSync:
             logger.info(f"{'='*60}")
             accounts_data = self.simplefin.get_accounts_with_transactions(start_date, end_date)
             
+            # Parse errors from SimpleFin response
+            error_orgs = self._parse_simplefin_errors(accounts_data)
+            
             # Create a map of account_id -> account data for quick lookup
             accounts_map = {}
             for acc in accounts_data.get('accounts', []):
@@ -1525,11 +1586,13 @@ class SimplefinToSheetsSync:
                 logger.info(f"[SUCCESS] Successfully synced account: {safe_account_name}")
                 
                 # Track for Index update
+                org_name = account.get('org', {}).get('name', '')
                 all_accounts_info.append({
                     'account_name': account_name,
                     'account_id': account_id,
                     'balance': balance,
                     'sheet_name': sheet_name,
+                    'org_name': org_name,
                     'ignore': False
                 })
             
@@ -1548,17 +1611,20 @@ class SimplefinToSheetsSync:
                 if sheet_name:
                     self.sheets.hide_sheet(sheet_name)
                 
+                # Get org_name from index_info or empty string
+                org_name = index_info.get('org_name', '')
                 all_accounts_info.append({
                     'account_name': account_name,
                     'account_id': account_id,
                     'balance': balance,
                     'sheet_name': sheet_name,
+                    'org_name': org_name,
                     'ignore': True
                 })
             
             # Step 8: Update Index sheet
             logger.info("\nUpdating Index sheet with latest information")
-            self._update_index_sheet(all_accounts_info, index_data)
+            self._update_index_sheet(all_accounts_info, index_data, error_orgs)
             
             logger.info("\n" + "="*60)
             logger.info("SYNCHRONIZATION COMPLETED SUCCESSFULLY")
