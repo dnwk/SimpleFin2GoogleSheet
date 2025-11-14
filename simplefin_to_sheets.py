@@ -802,7 +802,7 @@ class SimplefinToSheetsSync:
                 time.sleep(1)  # Throttle to stay under 60 req/min
                 result = self.sheets.service.spreadsheets().values().get(
                     spreadsheetId=self.sheets.spreadsheet_id,
-                    range="'Index'!A2:H1000"  # Read all data rows including Org Name
+                    range="'Index'!A2:I1000"  # Read all data rows including Sheet GID
                 ).execute()
                 
                 values = result.get('values', [])
@@ -812,17 +812,24 @@ class SimplefinToSheetsSync:
                         account_id = row[1]    # Column B
                         balance = row[2] if len(row) > 2 else ''
                         sheet_name = row[3] if len(row) > 3 else ''
-                        org_name = row[4] if len(row) > 4 else ''
+                        sheet_gid_str = row[4] if len(row) > 4 else ''
+                        # Convert sheet_gid to int if present
+                        try:
+                            sheet_gid = int(sheet_gid_str) if sheet_gid_str else None
+                        except (ValueError, TypeError):
+                            sheet_gid = None
+                        org_name = row[5] if len(row) > 5 else ''
                         # Default to false if not specified or invalid
-                        ignore_str = row[5].strip().lower() if len(row) > 5 and row[5] else 'false'
+                        ignore_str = row[6].strip().lower() if len(row) > 6 and row[6] else 'false'
                         ignore = ignore_str == 'true'
-                        # Connection status in column G (index 6)
-                        connection_status = row[6] if len(row) > 6 else ''
-                        last_updated = row[7] if len(row) > 7 else ''
+                        # Connection status in column H (index 7)
+                        connection_status = row[7] if len(row) > 7 else ''
+                        last_updated = row[8] if len(row) > 8 else ''
                         
                         index_map[account_id] = {
                             'account_name': account_name,
                             'sheet_name': sheet_name,
+                            'sheet_gid': sheet_gid,
                             'balance': balance,
                             'ignore': ignore,
                             'org_name': org_name,
@@ -962,6 +969,7 @@ class SimplefinToSheetsSync:
                     'account_id': account_id,
                     'balance': balance,
                     'sheet_name': base_name,  # Will be finalized when sheets are created
+                    'sheet_gid': None,  # Will be set when sheets are created
                     'org_name': org_name,
                     'ignore': False  # Default to false
                 })
@@ -1044,6 +1052,7 @@ class SimplefinToSheetsSync:
                     'account_id': account_id,
                     'balance': balance,
                     'sheet_name': sheet_name,
+                    'sheet_gid': None,  # Will be set when sheet is created
                     'org_name': org_name,
                     'ignore': False  # Default to false for new accounts
                 })
@@ -1058,6 +1067,7 @@ class SimplefinToSheetsSync:
                     'account_id': account_id,
                     'balance': info.get('balance', ''),
                     'sheet_name': info.get('sheet_name', ''),
+                    'sheet_gid': info.get('sheet_gid'),
                     'org_name': info.get('org_name', ''),
                     'ignore': info.get('ignore', False)
                 })
@@ -1097,7 +1107,7 @@ class SimplefinToSheetsSync:
                 time.sleep(1.5)  # Wait after creation
                 
                 # Create header row
-                header_data = [['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Org Name', 'Ignore', 'Connection Status', 'Last Updated']]
+                header_data = [['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Sheet GID', 'Org Name', 'Ignore', 'Connection Status', 'Last Updated']]
                 self.sheets.update_sheet_data('Index', header_data)
                 
                 # Format header with green background and white text
@@ -1121,7 +1131,7 @@ class SimplefinToSheetsSync:
                                         'startRowIndex': 0,
                                         'endRowIndex': 1,
                                         'startColumnIndex': 0,
-                                        'endColumnIndex': 8
+                                        'endColumnIndex': 9
                                     },
                                     'cell': {
                                         'userEnteredFormat': {
@@ -1187,7 +1197,7 @@ class SimplefinToSheetsSync:
                 error_orgs = []
             # Prepare data with hyperlinks
             data = []
-            data.append(['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Org Name', 'Ignore', 'Connection Status', 'Last Updated'])
+            data.append(['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Sheet GID', 'Org Name', 'Ignore', 'Connection Status', 'Last Updated'])
             
             for info in accounts_info:
                 account_id = info['account_id']
@@ -1203,7 +1213,12 @@ class SimplefinToSheetsSync:
                 
                 # Create hyperlink formula for account name with actual GID
                 if sheet_name:
-                    sheet_gid = self.sheets.get_sheet_gid(sheet_name)
+                    # Use cached GID from account info if available
+                    sheet_gid = info.get('sheet_gid')
+                    if sheet_gid is None:
+                        # Fallback to API call if not cached
+                        sheet_gid = self.sheets.get_sheet_gid(sheet_name)
+                    
                     if sheet_gid is not None:
                         # Use actual GID for hyperlink - sanitize account name for display
                         sanitized_name = self.sheets.sanitize_string(account_name)
@@ -1212,6 +1227,7 @@ class SimplefinToSheetsSync:
                         # Sheet doesn't exist yet (initial setup), use plain name
                         account_name_formula = self.sheets.sanitize_string(account_name)
                 else:
+                    sheet_gid = None
                     account_name_formula = self.sheets.sanitize_string(account_name)
                 
                 # Check if account's org is in error list
@@ -1232,6 +1248,7 @@ class SimplefinToSheetsSync:
                     account_id,
                     info['balance'],
                     sheet_name,
+                    sheet_gid if sheet_gid is not None else '',
                     self.sheets.sanitize_string(org_name),
                     str(ignore_flag).lower(),
                     connection_status,
@@ -1289,7 +1306,7 @@ class SimplefinToSheetsSync:
                                     'startRowIndex': 0,
                                     'endRowIndex': 1,
                                     'startColumnIndex': 0,
-                                    'endColumnIndex': 8
+                                    'endColumnIndex': 9
                                 },
                                 'cell': {
                                     'userEnteredFormat': {
@@ -1319,7 +1336,7 @@ class SimplefinToSheetsSync:
                                     'startRowIndex': 0,
                                     'endRowIndex': num_rows,
                                     'startColumnIndex': 0,
-                                    'endColumnIndex': 8
+                                    'endColumnIndex': 9
                                 },
                                 'top': {'style': 'SOLID', 'width': 1},
                                 'bottom': {'style': 'SOLID', 'width': 1},
@@ -1559,11 +1576,17 @@ class SimplefinToSheetsSync:
                 
                 if not sheet_exists:
                     logger.info(f"[Google Sheets API] Creating new sheet: {sheet_name}")
-                    self.sheets.create_sheet(sheet_name)
+                    sheet_gid = self.sheets.create_sheet(sheet_name)
                 else:
                     logger.info(f"[Google Sheets API] Sheet exists: {sheet_name}")
                     # Make sure sheet is not hidden
                     self.sheets.unhide_sheet(sheet_name)
+                    # Get the GID for this sheet (only one API call needed)
+                    sheet_gid = None
+                    for s in sheets:
+                        if s.get('properties', {}).get('title') == sheet_name:
+                            sheet_gid = s.get('properties', {}).get('sheetId')
+                            break
                 
                 # If connection error, add error banner but preserve existing data
                 if has_connection_error:
@@ -1655,6 +1678,7 @@ class SimplefinToSheetsSync:
                     'account_id': account_id,
                     'balance': balance,
                     'sheet_name': sheet_name,
+                    'sheet_gid': sheet_gid,
                     'org_name': org_name,
                     'preserve_timestamp': has_connection_error,  # Don't update timestamp if error
                     'ignore': False
@@ -1675,13 +1699,15 @@ class SimplefinToSheetsSync:
                 if sheet_name:
                     self.sheets.hide_sheet(sheet_name)
                 
-                # Get org_name from index_info or empty string
+                # Get org_name and sheet_gid from index_info
                 org_name = index_info.get('org_name', '')
+                sheet_gid = index_info.get('sheet_gid')
                 all_accounts_info.append({
                     'account_name': account_name,
                     'account_id': account_id,
                     'balance': balance,
                     'sheet_name': sheet_name,
+                    'sheet_gid': sheet_gid,
                     'org_name': org_name,
                     'ignore': True
                 })
