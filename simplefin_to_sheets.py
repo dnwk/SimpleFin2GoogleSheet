@@ -802,7 +802,7 @@ class SimplefinToSheetsSync:
                 time.sleep(1)  # Throttle to stay under 60 req/min
                 result = self.sheets.service.spreadsheets().values().get(
                     spreadsheetId=self.sheets.spreadsheet_id,
-                    range="'Index'!A2:G1000"  # Read all data rows including Connection Status
+                    range="'Index'!A2:H1000"  # Read all data rows including Org Name
                 ).execute()
                 
                 values = result.get('values', [])
@@ -812,19 +812,20 @@ class SimplefinToSheetsSync:
                         account_id = row[1]    # Column B
                         balance = row[2] if len(row) > 2 else ''
                         sheet_name = row[3] if len(row) > 3 else ''
+                        org_name = row[4] if len(row) > 4 else ''
                         # Default to false if not specified or invalid
-                        ignore_str = row[4].strip().lower() if len(row) > 4 and row[4] else 'false'
+                        ignore_str = row[5].strip().lower() if len(row) > 5 and row[5] else 'false'
                         ignore = ignore_str == 'true'
-                        # Connection status in column F (index 5)
-                        connection_status = row[5] if len(row) > 5 else ''
-                        last_updated = row[6] if len(row) > 6 else ''
+                        # Connection status in column G (index 6)
+                        connection_status = row[6] if len(row) > 6 else ''
+                        last_updated = row[7] if len(row) > 7 else ''
                         
                         index_map[account_id] = {
                             'account_name': account_name,
                             'sheet_name': sheet_name,
                             'balance': balance,
                             'ignore': ignore,
-                            'org_name': '',  # Will be updated from SimpleFin data
+                            'org_name': org_name,
                             'last_updated': last_updated
                         }
                 
@@ -1096,7 +1097,7 @@ class SimplefinToSheetsSync:
                 time.sleep(1.5)  # Wait after creation
                 
                 # Create header row
-                header_data = [['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Ignore', 'Connection Status', 'Last Updated']]
+                header_data = [['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Org Name', 'Ignore', 'Connection Status', 'Last Updated']]
                 self.sheets.update_sheet_data('Index', header_data)
                 
                 # Format header with green background and white text
@@ -1120,7 +1121,7 @@ class SimplefinToSheetsSync:
                                         'startRowIndex': 0,
                                         'endRowIndex': 1,
                                         'startColumnIndex': 0,
-                                        'endColumnIndex': 7
+                                        'endColumnIndex': 8
                                     },
                                     'cell': {
                                         'userEnteredFormat': {
@@ -1177,7 +1178,7 @@ class SimplefinToSheetsSync:
         Update or create the Index sheet with account information
         
         Args:
-            accounts_info: List of dicts with account_name, account_id, balance, sheet_name, ignore, org_name
+            accounts_info: List of dicts with account_name, account_id, balance, sheet_name, ignore, org_name, preserve_timestamp (optional)
             existing_index: Existing index data to preserve ignore flags
             error_orgs: List of organization names with connection errors
         """
@@ -1186,7 +1187,7 @@ class SimplefinToSheetsSync:
                 error_orgs = []
             # Prepare data with hyperlinks
             data = []
-            data.append(['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Ignore', 'Connection Status', 'Last Updated'])
+            data.append(['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Org Name', 'Ignore', 'Connection Status', 'Last Updated'])
             
             for info in accounts_info:
                 account_id = info['account_id']
@@ -1219,14 +1220,22 @@ class SimplefinToSheetsSync:
                 if org_name and org_name in error_orgs:
                     connection_status = 'Connection broken. Attention required'
                 
+                # Preserve last update timestamp if account has error
+                preserve_timestamp = info.get('preserve_timestamp', False)
+                if preserve_timestamp and account_id in existing_index:
+                    last_updated = existing_index[account_id].get('last_updated', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                else:
+                    last_updated = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                
                 data.append([
                     account_name_formula,
                     account_id,
                     info['balance'],
                     sheet_name,
+                    self.sheets.sanitize_string(org_name),
                     str(ignore_flag).lower(),
                     connection_status,
-                    datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    last_updated
                 ])
             
             # Update Index sheet
@@ -1280,7 +1289,7 @@ class SimplefinToSheetsSync:
                                     'startRowIndex': 0,
                                     'endRowIndex': 1,
                                     'startColumnIndex': 0,
-                                    'endColumnIndex': 7
+                                    'endColumnIndex': 8
                                 },
                                 'cell': {
                                     'userEnteredFormat': {
@@ -1310,7 +1319,7 @@ class SimplefinToSheetsSync:
                                     'startRowIndex': 0,
                                     'endRowIndex': num_rows,
                                     'startColumnIndex': 0,
-                                    'endColumnIndex': 7
+                                    'endColumnIndex': 8
                                 },
                                 'top': {'style': 'SOLID', 'width': 1},
                                 'bottom': {'style': 'SOLID', 'width': 1},
@@ -1531,6 +1540,7 @@ class SimplefinToSheetsSync:
                     continue
                 
                 balance = account.get('balance', '')
+                org_name = account.get('org', {}).get('name', '')
                 
                 # Get sheet name from Index
                 sheet_name = index_info.get('sheet_name', '')
@@ -1539,6 +1549,9 @@ class SimplefinToSheetsSync:
                     # No sheet name in index, create one
                     base_name = account_name.replace('/', '-').replace('\\', '-')[:100]
                     sheet_name = self.sheets.find_unique_sheet_name(base_name, account_id)
+                
+                # Check if this account has connection errors
+                has_connection_error = org_name and org_name in error_orgs
                 
                 # Check if sheet exists, create if needed
                 sheets = self.sheets.get_all_sheets()
@@ -1552,38 +1565,88 @@ class SimplefinToSheetsSync:
                     # Make sure sheet is not hidden
                     self.sheets.unhide_sheet(sheet_name)
                 
-                # Prepare data
-                transactions = account.get('transactions', [])
-                logger.info(f"Preparing data for {len(transactions)} transactions")
-                data = self._prepare_account_data(account, transactions, transaction_days)
-                
-                # Get Index sheet GID for back link
-                index_gid = self.sheets.get_sheet_gid('Index')
-                if index_gid is not None:
-                    # Replace placeholder with actual hyperlink using Index GID
-                    for i, row in enumerate(data):
-                        if row and row[0] == 'BACK_TO_INDEX_PLACEHOLDER':
-                            data[i] = [f'=HYPERLINK("#gid={index_gid}&range=A1", "← Back to Index")']
-                            break
+                # If connection error, add error banner but preserve existing data
+                if has_connection_error:
+                    logger.warning(f"Connection error detected for {org_name}, adding error banner")
+                    
+                    # Read existing sheet data (if any)
+                    existing_data = []
+                    try:
+                        time.sleep(1)  # Throttle to stay under 60 req/min
+                        result = self.sheets.service.spreadsheets().values().get(
+                            spreadsheetId=self.sheets.spreadsheet_id,
+                            range=f"'{sheet_name}'!A1:Z1000"
+                        ).execute()
+                        existing_data = result.get('values', [])
+                    except Exception as e:
+                        logger.warning(f"Could not read existing data from '{sheet_name}': {e}")
+                    
+                    # Create error banner to prepend
+                    error_banner = [
+                        [f'⚠️ CONNECTION ERROR - Last checked: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} ⚠️'],
+                        [f'Connection to {org_name} may need attention. Please re-authenticate in SimpleFin.'],
+                        ['Data below may be outdated until connection is restored.'],
+                        [],  # Separator
+                    ]
+                    
+                    # Combine error banner with existing data
+                    if existing_data:
+                        # Remove old error banner if present (first 4 rows if they contain error message)
+                        if existing_data and len(existing_data) > 0:
+                            if '⚠️ CONNECTION ERROR' in str(existing_data[0]):
+                                # Skip old error banner (4 rows)
+                                existing_data = existing_data[4:] if len(existing_data) > 4 else []
+                        
+                        data = error_banner + existing_data
+                    else:
+                        # No existing data, create minimal sheet with error
+                        data = error_banner + [
+                            ['Account Information'],
+                            ['Account ID:', self.sheets.sanitize_string(account.get('id', ''))],
+                            ['Account Name:', self.sheets.sanitize_string(account.get('name', ''))],
+                            [],
+                            ['No data available - connection error prevents data retrieval.']
+                        ]
                 else:
-                    # Fallback if Index GID not found
-                    for i, row in enumerate(data):
-                        if row and row[0] == 'BACK_TO_INDEX_PLACEHOLDER':
-                            data[i] = ['← Back to Index']
-                            break
+                    # Prepare data normally
+                    transactions = account.get('transactions', [])
+                    logger.info(f"Preparing data for {len(transactions)} transactions")
+                    data = self._prepare_account_data(account, transactions, transaction_days)
+                
+                # Get Index sheet GID for back link (only for normal data, not error message)
+                if not has_connection_error:
+                    index_gid = self.sheets.get_sheet_gid('Index')
+                    if index_gid is not None:
+                        # Replace placeholder with actual hyperlink using Index GID
+                        for i, row in enumerate(data):
+                            if row and row[0] == 'BACK_TO_INDEX_PLACEHOLDER':
+                                data[i] = [f'=HYPERLINK("#gid={index_gid}&range=A1", "← Back to Index")']
+                                break
+                    else:
+                        # Fallback if Index GID not found
+                        for i, row in enumerate(data):
+                            if row and row[0] == 'BACK_TO_INDEX_PLACEHOLDER':
+                                data[i] = ['← Back to Index']
+                                break
                 
                 # Update Google Sheet for this account
-                logger.info(f"[Google Sheets API] Updating sheet '{sheet_name}'")
+                if has_connection_error:
+                    logger.info(f"[Google Sheets API] Updating sheet '{sheet_name}' with connection error message")
+                else:
+                    logger.info(f"[Google Sheets API] Updating sheet '{sheet_name}'")
                 self.sheets.update_sheet_data(sheet_name, data)
                 
-                logger.info(f"[Google Sheets API] Formatting sheet '{sheet_name}'")
-                self.sheets.format_sheet_header(sheet_name)
-                
-                # Set column B width to 400 pixels
-                logger.info(f"[Google Sheets API] Setting column width for '{sheet_name}'")
-                self.sheets.set_column_width(sheet_name, 1, 400)
-                
-                logger.info(f"[SUCCESS] Successfully synced account: {safe_account_name}")
+                if not has_connection_error:
+                    logger.info(f"[Google Sheets API] Formatting sheet '{sheet_name}'")
+                    self.sheets.format_sheet_header(sheet_name)
+                    
+                    # Set column B width to 400 pixels
+                    logger.info(f"[Google Sheets API] Setting column width for '{sheet_name}'")
+                    self.sheets.set_column_width(sheet_name, 1, 400)
+                    
+                    logger.info(f"[SUCCESS] Successfully synced account: {safe_account_name}")
+                else:
+                    logger.warning(f"[WARNING] Account has connection error: {safe_account_name}")
                 
                 # Track for Index update
                 org_name = account.get('org', {}).get('name', '')
@@ -1593,6 +1656,7 @@ class SimplefinToSheetsSync:
                     'balance': balance,
                     'sheet_name': sheet_name,
                     'org_name': org_name,
+                    'preserve_timestamp': has_connection_error,  # Don't update timestamp if error
                     'ignore': False
                 })
             
