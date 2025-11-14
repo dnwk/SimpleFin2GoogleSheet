@@ -295,6 +295,18 @@ class GoogleSheetsClient:
             logger.error(f"Error getting sheets: {e}")
             raise
     
+    def get_sheet_gid(self, sheet_name: str) -> Optional[int]:
+        """Get the GID (sheet ID) for a sheet by name"""
+        try:
+            sheets = self.get_all_sheets()
+            for sheet in sheets:
+                if sheet.get('properties', {}).get('title') == sheet_name:
+                    return sheet.get('properties', {}).get('sheetId')
+            return None
+        except Exception as e:
+            logger.warning(f"Error getting sheet GID for '{sheet_name}': {e}")
+            return None
+    
     @retry_on_rate_limit(max_retries=5, initial_delay=2)
     def find_sheet_by_account_id(self, account_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -1127,11 +1139,15 @@ class SimplefinToSheetsSync:
                     # Default to false for new accounts
                     ignore_flag = info.get('ignore', False)
                 
-                # Create hyperlink formula for account name
+                # Create hyperlink formula for account name with actual GID
                 if sheet_name:
-                    # Formula: =HYPERLINK("#gid=SHEET_ID", "Display Text")
-                    # We'll use sheet name reference instead since we don't have sheet ID here
-                    account_name_formula = f'=HYPERLINK("#gid=0&range=\'{sheet_name}\'!A1", "{account_name}")'
+                    sheet_gid = self.sheets.get_sheet_gid(sheet_name)
+                    if sheet_gid is not None:
+                        # Use actual GID for hyperlink
+                        account_name_formula = f'=HYPERLINK("#gid={sheet_gid}&range=A1", "{account_name}")'
+                    else:
+                        # Sheet doesn't exist yet (initial setup), use plain name
+                        account_name_formula = account_name
                 else:
                     account_name_formula = account_name
                 
@@ -1317,10 +1333,11 @@ class SimplefinToSheetsSync:
             
             data.append([date_formula, description, amount, txn_id, pending])
         
-        # Add back link to Index at the bottom
+        # Add back link to Index at the bottom with actual Index GID
         data.append([])  # Empty row
         data.append([])  # Another empty row for spacing
-        data.append(['=HYPERLINK("#gid=0&range=Index!A1", "← Back to Index")'])
+        # Placeholder for back link - will be set when writing to sheet
+        data.append(['BACK_TO_INDEX_PLACEHOLDER'])
         
         return data
     
@@ -1420,6 +1437,21 @@ class SimplefinToSheetsSync:
                 transactions = account.get('transactions', [])
                 logger.info(f"Preparing data for {len(transactions)} transactions")
                 data = self._prepare_account_data(account, transactions)
+                
+                # Get Index sheet GID for back link
+                index_gid = self.sheets.get_sheet_gid('Index')
+                if index_gid is not None:
+                    # Replace placeholder with actual hyperlink using Index GID
+                    for i, row in enumerate(data):
+                        if row and row[0] == 'BACK_TO_INDEX_PLACEHOLDER':
+                            data[i] = [f'=HYPERLINK("#gid={index_gid}&range=A1", "← Back to Index")']
+                            break
+                else:
+                    # Fallback if Index GID not found
+                    for i, row in enumerate(data):
+                        if row and row[0] == 'BACK_TO_INDEX_PLACEHOLDER':
+                            data[i] = ['← Back to Index']
+                            break
                 
                 # Update Google Sheet for this account
                 logger.info(f"[Google Sheets API] Updating sheet '{sheet_name}'")
