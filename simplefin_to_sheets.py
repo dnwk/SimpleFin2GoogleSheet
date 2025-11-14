@@ -24,7 +24,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('simplefin_sync.log'),
+        logging.FileHandler('simplefin_sync.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -230,14 +230,16 @@ class GoogleSheetsClient:
         self.service = self._authenticate(credentials_file)
     
     @staticmethod
-    def sanitize_string(value: str) -> str:
+    def sanitize_string(value: str, strip_unicode: bool = True) -> str:
         """
         Sanitize string for safe writing to Google Sheets
         - Prevents formula injection by escaping leading special characters
         - Removes null bytes and other problematic characters
+        - By default strips non-ASCII Unicode characters (for account names)
         
         Args:
             value: String to sanitize
+            strip_unicode: If True (default), remove non-ASCII characters
             
         Returns:
             Sanitized string safe for Google Sheets
@@ -247,6 +249,12 @@ class GoogleSheetsClient:
         
         # Remove null bytes and other control characters (except newlines/tabs)
         value = ''.join(char for char in value if char == '\n' or char == '\t' or ord(char) >= 32)
+        
+        # Strip non-ASCII Unicode characters if requested (for account names)
+        if strip_unicode:
+            value = ''.join(char if ord(char) < 128 else '' for char in value)
+            # Clean up any extra spaces created by Unicode removal
+            value = ' '.join(value.split())
         
         # Prevent formula injection - escape leading special characters
         # Google Sheets formulas start with: = + - @ 
@@ -1446,8 +1454,12 @@ class SimplefinToSheetsSync:
             
             for account_id, index_info in accounts_to_update:
                 account_name = index_info.get('account_name', 'Unknown Account')
+                # Strip Unicode for logging to prevent console encoding errors
+                safe_account_name = ''.join(char if ord(char) < 128 else '' for char in account_name)
+                safe_account_name = ' '.join(safe_account_name.split())  # Clean up spaces
+                
                 logger.info(f"\n{'='*60}")
-                logger.info(f"Processing account: {account_name} (ID: {account_id})")
+                logger.info(f"Processing account: {safe_account_name} (ID: {account_id})")
                 logger.info(f"{'='*60}")
                 
                 # Get account data from the map
@@ -1510,7 +1522,7 @@ class SimplefinToSheetsSync:
                 logger.info(f"[Google Sheets API] Setting column width for '{sheet_name}'")
                 self.sheets.set_column_width(sheet_name, 1, 400)
                 
-                logger.info(f"[SUCCESS] Successfully synced account: {account_name}")
+                logger.info(f"[SUCCESS] Successfully synced account: {safe_account_name}")
                 
                 # Track for Index update
                 all_accounts_info.append({
@@ -1527,7 +1539,11 @@ class SimplefinToSheetsSync:
                 balance = index_info.get('balance', '')
                 sheet_name = index_info.get('sheet_name', '')
                 
-                logger.info(f"Skipping ignored account: {account_name}")
+                # Strip Unicode for logging
+                safe_account_name = ''.join(char if ord(char) < 128 else '' for char in account_name)
+                safe_account_name = ' '.join(safe_account_name.split())
+                
+                logger.info(f"Skipping ignored account: {safe_account_name}")
                 
                 if sheet_name:
                     self.sheets.hide_sheet(sheet_name)
