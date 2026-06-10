@@ -822,7 +822,7 @@ class SimplefinToSheetsSync:
                 time.sleep(1)  # Throttle to stay under 60 req/min
                 result = self.sheets.service.spreadsheets().values().get(
                     spreadsheetId=self.sheets.spreadsheet_id,
-                    range="'Index'!A2:I1000"  # Read all data rows including Sheet GID
+                    range="'Index'!A2:J1000"  # Read all data rows including Sheet GID
                 ).execute()
                 
                 values = result.get('values', [])
@@ -845,6 +845,9 @@ class SimplefinToSheetsSync:
                         # Connection status in column H (index 7)
                         connection_status = row[7] if len(row) > 7 else ''
                         last_updated = row[8] if len(row) > 8 else ''
+                        # Include in Current Month in column J (index 9), default true
+                        include_str = row[9].strip().lower() if len(row) > 9 and row[9] else 'true'
+                        include_in_current_month = include_str != 'false'
                         
                         index_map[account_id] = {
                             'account_name': account_name,
@@ -853,7 +856,8 @@ class SimplefinToSheetsSync:
                             'balance': balance,
                             'ignore': ignore,
                             'org_name': org_name,
-                            'last_updated': last_updated
+                            'last_updated': last_updated,
+                            'include_in_current_month': include_in_current_month
                         }
                 
                 logger.info(f"Loaded {len(index_map)} accounts from Index sheet")
@@ -1127,7 +1131,7 @@ class SimplefinToSheetsSync:
                 time.sleep(1.5)  # Wait after creation
                 
                 # Create header row
-                header_data = [['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Sheet GID', 'Org Name', 'Ignore', 'Connection Status', 'Last Updated']]
+                header_data = [['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Sheet GID', 'Org Name', 'Ignore', 'Connection Status', 'Last Updated', 'Include in Current Month']]
                 self.sheets.update_sheet_data('Index', header_data)
                 
                 # Format header with green background and white text
@@ -1151,7 +1155,7 @@ class SimplefinToSheetsSync:
                                         'startRowIndex': 0,
                                         'endRowIndex': 1,
                                         'startColumnIndex': 0,
-                                        'endColumnIndex': 9
+                                        'endColumnIndex': 10
                                     },
                                     'cell': {
                                         'userEnteredFormat': {
@@ -1217,7 +1221,7 @@ class SimplefinToSheetsSync:
                 error_orgs = []
             # Prepare data with hyperlinks
             data = []
-            data.append(['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Sheet GID', 'Org Name', 'Ignore', 'Connection Status', 'Last Updated'])
+            data.append(['Account Name', 'Account ID', 'Balance', 'Sheet Name', 'Sheet GID', 'Org Name', 'Ignore', 'Connection Status', 'Last Updated', 'Include in Current Month'])
             
             for info in accounts_info:
                 account_id = info['account_id']
@@ -1227,9 +1231,11 @@ class SimplefinToSheetsSync:
                 # Preserve existing ignore flag if account exists in index
                 if account_id in existing_index:
                     ignore_flag = existing_index[account_id].get('ignore', False)
+                    include_flag = existing_index[account_id].get('include_in_current_month', True)
                 else:
                     # Default to false for new accounts
                     ignore_flag = info.get('ignore', False)
+                    include_flag = info.get('include_in_current_month', True)
                 
                 # Create hyperlink formula for account name with actual GID
                 if sheet_name:
@@ -1272,7 +1278,8 @@ class SimplefinToSheetsSync:
                     self.sheets.sanitize_string(org_name),
                     str(ignore_flag).lower(),
                     connection_status,
-                    last_updated
+                    last_updated,
+                    str(include_flag).lower()
                 ])
             
             # Update Index sheet
@@ -1326,7 +1333,7 @@ class SimplefinToSheetsSync:
                                     'startRowIndex': 0,
                                     'endRowIndex': 1,
                                     'startColumnIndex': 0,
-                                    'endColumnIndex': 9
+                                    'endColumnIndex': 10
                                 },
                                 'cell': {
                                     'userEnteredFormat': {
@@ -1356,7 +1363,7 @@ class SimplefinToSheetsSync:
                                     'startRowIndex': 0,
                                     'endRowIndex': num_rows,
                                     'startColumnIndex': 0,
-                                    'endColumnIndex': 9
+                                    'endColumnIndex': 10
                                 },
                                 'top': {'style': 'SOLID', 'width': 1},
                                 'bottom': {'style': 'SOLID', 'width': 1},
@@ -1436,6 +1443,16 @@ class SimplefinToSheetsSync:
             data.append(['Account', 'Date', 'Description', 'Amount', 'Transaction ID', 'Pending'])
             for _, row in current_month_rows:
                 data.append(row)
+
+            # SUM row: data rows start at spreadsheet row 4 (1-indexed), header is row 3
+            # Amount column is D (column index 4 in 1-based, letter D)
+            first_data_row = 4
+            last_data_row = 3 + len(current_month_rows)
+            if len(current_month_rows) > 0:
+                sum_formula = f'=SUM(D{first_data_row}:D{last_data_row})'
+            else:
+                sum_formula = '0'
+            data.append(['', '', 'Total', sum_formula, '', ''])
 
             # Ensure sheet exists
             sheets = self.sheets.get_all_sheets()
@@ -1721,11 +1738,12 @@ class SimplefinToSheetsSync:
                     transactions = account.get('transactions', [])
                     logger.info(f"Preparing data for {len(transactions)} transactions")
                     data = self._prepare_account_data(account, transactions, transaction_days)
-                    # Collect for Current Month sheet
-                    current_month_data.append({
-                        'account_name': account_name,
-                        'transactions': transactions
-                    })
+                    # Collect for Current Month sheet (only if flagged)
+                    if index_info.get('include_in_current_month', True):
+                        current_month_data.append({
+                            'account_name': account_name,
+                            'transactions': transactions
+                        })
                 
                 # Get Index sheet GID for back link (only for normal data, not error message)
                 if not has_connection_error:
