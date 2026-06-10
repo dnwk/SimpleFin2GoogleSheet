@@ -911,7 +911,7 @@ class SimplefinToSheetsSync:
                 sheet_name = sheet.get('properties', {}).get('title', '')
                 sheet_id = sheet.get('properties', {}).get('sheetId')
                 
-                if sheet_name != 'Index' and sheet_id is not None:
+                if sheet_name != 'Index' and sheet_name != 'Current Month' and sheet_id is not None:
                     sheets_to_delete.append(sheet_id)
             
             if sheets_to_delete:
@@ -1394,6 +1394,71 @@ class SimplefinToSheetsSync:
             logger.error(f"Error updating Index sheet: {e}")
             raise
     
+    def _update_current_month_sheet(self, accounts_with_transactions: List[Dict[str, Any]]):
+        """
+        Create or update the 'Current Month' sheet with all transactions
+        from the current calendar month aggregated across all synced accounts.
+
+        Args:
+            accounts_with_transactions: List of dicts with keys
+                'account_name' (str) and 'transactions' (list of SimpleFin txn dicts)
+        """
+        try:
+            now = datetime.now()
+            current_year = now.year
+            current_month = now.month
+            sheet_name = 'Current Month'
+
+            # Gather all current-month transactions with sort key
+            current_month_rows = []
+
+            for entry in accounts_with_transactions:
+                account_name = self.sheets.sanitize_string(entry['account_name'])
+                for txn in entry['transactions']:
+                    posted = txn.get('posted', 0)
+                    if not posted:
+                        continue
+                    txn_date = datetime.fromtimestamp(posted)
+                    if txn_date.year == current_year and txn_date.month == current_month:
+                        description = self.sheets.sanitize_string(txn.get('description', ''), strip_unicode=False)
+                        amount = txn.get('amount', '')
+                        txn_id = self.sheets.sanitize_string(txn.get('id', ''))
+                        pending = 'Yes' if txn.get('pending', False) else 'No'
+                        date_formula = f'=EPOCHTODATE({posted})'
+                        current_month_rows.append((posted, [account_name, date_formula, description, amount, txn_id, pending]))
+
+            # Sort newest first
+            current_month_rows.sort(key=lambda x: x[0], reverse=True)
+
+            month_label = now.strftime('%B %Y')
+            data = [[f'Current Month Transactions - {month_label}']]
+            data.append([])  # Empty row
+            data.append(['Account', 'Date', 'Description', 'Amount', 'Transaction ID', 'Pending'])
+            for _, row in current_month_rows:
+                data.append(row)
+
+            # Ensure sheet exists
+            sheets = self.sheets.get_all_sheets()
+            sheet_exists = any(s.get('properties', {}).get('title') == sheet_name for s in sheets)
+
+            if not sheet_exists:
+                logger.info(f"Creating '{sheet_name}' sheet")
+                self.sheets.create_sheet(sheet_name)
+
+            logger.info(f"[Google Sheets API] Updating '{sheet_name}' with {len(current_month_rows)} transactions")
+            self.sheets.update_sheet_data(sheet_name, data)
+
+            # Format the header row (row index 2 = row 3 in UI)
+            self.sheets.format_sheet_header(sheet_name)
+
+            # Widen the Description column (column C, index 2)
+            self.sheets.set_column_width(sheet_name, 2, 400)
+
+            logger.info(f"[SUCCESS] '{sheet_name}' sheet updated successfully")
+
+        except Exception as e:
+            logger.error(f"Error updating '{sheet_name}' sheet: {e}")
+
     def _prepare_account_data(self, account: Dict[str, Any], transactions: List[Dict[str, Any]], transaction_days: int = 60) -> List[List[Any]]:
         """
         Prepare account data for Google Sheets
@@ -1558,7 +1623,8 @@ class SimplefinToSheetsSync:
             
             # Step 6: Process each account for sheet updates
             all_accounts_info = []
-            
+            current_month_data = []  # Collect transactions for Current Month sheet
+
             for account_id, index_info in accounts_to_update:
                 account_name = index_info.get('account_name', 'Unknown Account')
                 # Strip Unicode for logging to prevent console encoding errors
@@ -1655,6 +1721,11 @@ class SimplefinToSheetsSync:
                     transactions = account.get('transactions', [])
                     logger.info(f"Preparing data for {len(transactions)} transactions")
                     data = self._prepare_account_data(account, transactions, transaction_days)
+                    # Collect for Current Month sheet
+                    current_month_data.append({
+                        'account_name': account_name,
+                        'transactions': transactions
+                    })
                 
                 # Get Index sheet GID for back link (only for normal data, not error message)
                 if not has_connection_error:
@@ -1731,8 +1802,12 @@ class SimplefinToSheetsSync:
                     'org_name': org_name,
                     'ignore': True
                 })
-            
-            # Step 8: Update Index sheet
+
+            # Step 8: Update Current Month sheet
+            logger.info("\nUpdating Current Month sheet")
+            self._update_current_month_sheet(current_month_data)
+
+            # Step 9: Update Index sheet
             logger.info("\nUpdating Index sheet with latest information")
             self._update_index_sheet(all_accounts_info, index_data, error_orgs)
             
