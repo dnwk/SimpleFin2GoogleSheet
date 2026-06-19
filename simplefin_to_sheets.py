@@ -1449,7 +1449,7 @@ class SimplefinToSheetsSync:
             first_data_row = 4
             last_data_row = 3 + len(current_month_rows)
             if len(current_month_rows) > 0:
-                sum_formula = f'=SUM(D{first_data_row}:D{last_data_row})'
+                sum_formula = f'=SUMIF(D{first_data_row}:D{last_data_row},"<0")'
             else:
                 sum_formula = '0'
             data.append(['', '', 'Total', sum_formula, '', ''])
