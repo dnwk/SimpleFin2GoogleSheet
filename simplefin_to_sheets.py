@@ -1406,6 +1406,13 @@ class SimplefinToSheetsSync:
         Create or update the 'Current Month' sheet with all transactions
         from the current calendar month aggregated across all synced accounts.
 
+        Existing rows are preserved (matched by Transaction ID in column E)
+        so any manual edits by the user are not overwritten. New transactions
+        are appended below the existing ones.
+
+        If the sheet's month label doesn't match the current month, the sheet
+        is fully rebuilt (new month started).
+
         Args:
             accounts_with_transactions: List of dicts with keys
                 'account_name' (str) and 'transactions' (list of SimpleFin txn dicts)
@@ -1415,44 +1422,8 @@ class SimplefinToSheetsSync:
             current_year = now.year
             current_month = now.month
             sheet_name = 'Current Month'
-
-            # Gather all current-month transactions with sort key
-            current_month_rows = []
-
-            for entry in accounts_with_transactions:
-                account_name = self.sheets.sanitize_string(entry['account_name'])
-                for txn in entry['transactions']:
-                    posted = txn.get('posted', 0)
-                    if not posted:
-                        continue
-                    txn_date = datetime.fromtimestamp(posted)
-                    if txn_date.year == current_year and txn_date.month == current_month:
-                        description = self.sheets.sanitize_string(txn.get('description', ''), strip_unicode=False)
-                        amount = txn.get('amount', '')
-                        txn_id = self.sheets.sanitize_string(txn.get('id', ''))
-                        pending = 'Yes' if txn.get('pending', False) else 'No'
-                        date_formula = f'=EPOCHTODATE({posted})'
-                        current_month_rows.append((posted, [account_name, date_formula, description, amount, txn_id, pending]))
-
-            # Sort newest first
-            current_month_rows.sort(key=lambda x: x[0], reverse=True)
-
             month_label = now.strftime('%B %Y')
-            data = [[f'Current Month Transactions - {month_label}']]
-            data.append([])  # Empty row
-            data.append(['Account', 'Date', 'Description', 'Amount', 'Transaction ID', 'Pending'])
-            for _, row in current_month_rows:
-                data.append(row)
-
-            # SUM row: data rows start at spreadsheet row 4 (1-indexed), header is row 3
-            # Amount column is D (column index 4 in 1-based, letter D)
-            first_data_row = 4
-            last_data_row = 3 + len(current_month_rows)
-            if len(current_month_rows) > 0:
-                sum_formula = f'=SUMIF(D{first_data_row}:D{last_data_row},"<0")'
-            else:
-                sum_formula = '0'
-            data.append(['', '', 'Total', sum_formula, '', ''])
+            title_text = f'Current Month Transactions - {month_label}'
 
             # Ensure sheet exists
             sheets = self.sheets.get_all_sheets()
@@ -1462,7 +1433,99 @@ class SimplefinToSheetsSync:
                 logger.info(f"Creating '{sheet_name}' sheet")
                 self.sheets.create_sheet(sheet_name)
 
-            logger.info(f"[Google Sheets API] Updating '{sheet_name}' with {len(current_month_rows)} transactions")
+            # Read existing sheet contents to detect month rollover and gather existing txn IDs
+            existing_rows = []
+            existing_title = ''
+            try:
+                time.sleep(1)  # Throttle
+                result = self.sheets.service.spreadsheets().values().get(
+                    spreadsheetId=self.sheets.spreadsheet_id,
+                    range=f"'{sheet_name}'!A1:F5000"
+                ).execute()
+                existing_values = result.get('values', [])
+                if existing_values:
+                    existing_title = existing_values[0][0] if existing_values[0] else ''
+                    # Data rows begin at index 3 (row 4 in UI): 0=title, 1=blank, 2=header, 3+=data
+                    for row in existing_values[3:]:
+                        if not row:
+                            continue
+                        # Stop at Total/summary rows or empty separators
+                        if len(row) >= 3 and str(row[2]).strip().lower() == 'total':
+                            continue
+                        # Skip completely empty rows
+                        if all((not c or not str(c).strip()) for c in row):
+                            continue
+                        existing_rows.append(row)
+            except HttpError as e:
+                logger.info(f"No existing '{sheet_name}' data to preserve: {e}")
+            except Exception as e:
+                logger.warning(f"Could not read existing '{sheet_name}' data: {e}")
+
+            # If month label changed (new month), rebuild from scratch
+            rebuild = existing_title.strip() != title_text
+            if rebuild and existing_rows:
+                logger.info(f"'{sheet_name}' sheet is for a different month; rebuilding")
+                existing_rows = []
+
+            # Build set of transaction IDs already present (column E = index 4)
+            existing_txn_ids = set()
+            for row in existing_rows:
+                if len(row) > 4 and row[4]:
+                    existing_txn_ids.add(str(row[4]).strip())
+
+            # Gather NEW current-month transactions (not already in sheet)
+            new_rows = []
+            for entry in accounts_with_transactions:
+                account_name = self.sheets.sanitize_string(entry['account_name'])
+                for txn in entry['transactions']:
+                    posted = txn.get('posted', 0)
+                    if not posted:
+                        continue
+                    txn_date = datetime.fromtimestamp(posted)
+                    if txn_date.year != current_year or txn_date.month != current_month:
+                        continue
+                    txn_id = self.sheets.sanitize_string(txn.get('id', ''))
+                    # Skip if already in the sheet
+                    if txn_id and txn_id in existing_txn_ids:
+                        continue
+                    description = self.sheets.sanitize_string(txn.get('description', ''), strip_unicode=False)
+                    amount = txn.get('amount', '')
+                    pending = 'Yes' if txn.get('pending', False) else 'No'
+                    date_formula = f'=EPOCHTODATE({posted})'
+                    new_rows.append((posted, [account_name, date_formula, description, amount, txn_id, pending]))
+
+            # Sort new rows newest first
+            new_rows.sort(key=lambda x: x[0], reverse=True)
+            new_row_values = [r for _, r in new_rows]
+
+            # Compose final data: title, blank, header, existing rows, new rows, total
+            data = [[title_text]]
+            data.append([])
+            data.append(['Account', 'Date', 'Description', 'Amount', 'Transaction ID', 'Pending'])
+
+            # Re-add existing rows verbatim (preserves user edits). Pad short rows to 6 cols.
+            for row in existing_rows:
+                padded = list(row) + [''] * (6 - len(row))
+                data.append(padded[:6])
+
+            for row in new_row_values:
+                data.append(row)
+
+            total_data_rows = len(existing_rows) + len(new_row_values)
+
+            # SUM row over column D (Amount), only negative values
+            first_data_row = 4
+            last_data_row = 3 + total_data_rows
+            if total_data_rows > 0:
+                sum_formula = f'=SUMIF(D{first_data_row}:D{last_data_row},"<0")'
+            else:
+                sum_formula = '0'
+            data.append(['', '', 'Total', sum_formula, '', ''])
+
+            logger.info(
+                f"[Google Sheets API] Updating '{sheet_name}': {len(existing_rows)} preserved, "
+                f"{len(new_row_values)} new transactions"
+            )
             self.sheets.update_sheet_data(sheet_name, data)
 
             # Format the header row (row index 2 = row 3 in UI)
@@ -1474,7 +1537,7 @@ class SimplefinToSheetsSync:
             logger.info(f"[SUCCESS] '{sheet_name}' sheet updated successfully")
 
         except Exception as e:
-            logger.error(f"Error updating '{sheet_name}' sheet: {e}")
+            logger.error(f"Error updating 'Current Month' sheet: {e}")
 
     def _prepare_account_data(self, account: Dict[str, Any], transactions: List[Dict[str, Any]], transaction_days: int = 60) -> List[List[Any]]:
         """
